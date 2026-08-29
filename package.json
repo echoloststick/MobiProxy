@@ -1,0 +1,16 @@
+{
+  "name": "smfx-mobiproxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Proxy pro Publish/Load do SMFX -- monta o RBXLX e repassa pro Open Cloud, e proxya GETs de leitura da api Roblox.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
