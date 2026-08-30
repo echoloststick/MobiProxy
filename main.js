@@ -102,6 +102,40 @@ function propertyXML(propName, kind, value) {
 // Monta a arvore (Parent -> children) a partir do dict achatado por ID
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Prioridade de classe -- objetos "estruturais" (Parts, Humanoid) precisam
+// aparecer no XML ANTES de objetos "dependentes" que reagem à existência
+// deles no parse (CharacterMesh so aplica a malha se o Humanoid/BodyPart ja
+// existir; Attachment/Motor6D so calculam certo com o pai ja no lugar).
+// pairs() no Lua nao garante ordem, entao sem isso a ordem de emissao no
+// XML era essencialmente aleatoria -- ordenar aqui resolve isso de vez.
+// ---------------------------------------------------------------------------
+
+const STRUCTURAL_PRIORITY = 0;
+const DEFAULT_PRIORITY = 5;
+const DEPENDENT_PRIORITY = 10;
+
+const STRUCTURAL_CLASSES = new Set([
+	'Part', 'MeshPart', 'WedgePart', 'CornerWedgePart', 'UnionOperation', 'NegateOperation',
+	'TrussPart', 'VehicleSeat', 'Seat', 'SpawnLocation', 'Model', 'Folder', 'Humanoid',
+]);
+
+const DEPENDENT_CLASSES = new Set([
+	'CharacterMesh', 'Attachment', 'Motor6D', 'Motor', 'Weld', 'WeldConstraint',
+	'RopeConstraint', 'RodConstraint', 'SpecialMesh', 'Decal', 'Texture', 'BodyColors',
+]);
+
+function priorityOf(className) {
+	if (STRUCTURAL_CLASSES.has(className)) return STRUCTURAL_PRIORITY;
+	if (DEPENDENT_CLASSES.has(className)) return DEPENDENT_PRIORITY;
+	return DEFAULT_PRIORITY;
+}
+
+function sortChildrenRecursive(node) {
+	node.children.sort((a, b) => priorityOf(a.className) - priorityOf(b.className));
+	for (const child of node.children) sortChildrenRecursive(child);
+}
+
 function buildTree(objects) {
 	const nodes = {};
 	for (const [idStr, data] of Object.entries(objects)) {
@@ -174,6 +208,9 @@ function emitNode(node, out, nodes) {
 
 function buildRBXLX(objects) {
 	const { roots, nodes } = buildTree(objects);
+
+	for (const root of roots) sortChildrenRecursive(root);
+	roots.sort((a, b) => priorityOf(a.className) - priorityOf(b.className));
 
 	const counter = { n: 0 };
 	for (const root of roots) assignReferents(root, counter);
@@ -267,4 +304,4 @@ const port = process.env.PORT || 8080;
 app.listen(port, '0.0.0.0', () => {
 	console.log(`[SMFX Proxy] Listening on port ${port}`);
 });
-													 
+			
