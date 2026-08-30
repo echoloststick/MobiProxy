@@ -1,10 +1,15 @@
 // SMFX Publish Proxy (Node.js / Express)
-// Duas rotas:
-//   POST /publish -> recebe { url, objects } em JSON, monta o RBXLX e repassa pro Open Cloud
-//   GET  /get     -> proxy generico de leitura (usado pra resolver universeId/rootPlaceId,
-//                    que o HttpService do jogo nao alcanca direto por serem dominios *.roblox.com)
+// Rotas:
+//   POST /publish  -> recebe { url, objects } em JSON, monta o RBXLX e repassa pro Open Cloud
+//   GET  /get      -> proxy generico de leitura (usado pra resolver universeId/rootPlaceId,
+//                     que o HttpService do jogo nao alcanca direto por serem dominios *.roblox.com)
+//   POST /colorize -> recebe { code } em JSON, devolve { colored } em RichText -- usado pelo
+//                     Script Editor pra colorir o codigo sem depender do autoformat de aspas
+//                     do teclado mobile (que atrapalha se a coloracao for gerada no Lua)
 
 const express = require('express');
+const { colorizeLua } = require('./colorize');
+
 const app = express();
 
 app.use(express.json({ limit: '50mb' })); // projeto grande gera JSON grande
@@ -241,7 +246,25 @@ app.get('/get', async (req, res) => {
 	}
 });
 
+// Colore codigo Luau em RichText, pro Script Editor. Fica no proxy (nao no
+// Lua) por dois motivos: o teclado mobile auto-formata aspas/etc quando o
+// texto e montado direto no client, e HttpService/regex pesado em Lua e
+// mais caro/limitado que fazer isso em JS.
+app.post('/colorize', (req, res) => {
+	const { code } = req.body || {};
+	if (typeof code !== 'string') {
+		return res.status(400).json({ error: "campo 'code' obrigatorio" });
+	}
+
+	try {
+		res.json({ colored: colorizeLua(code) });
+	} catch (e) {
+		res.status(500).json({ error: `colorize failed: ${e.message}` });
+	}
+});
+
 const port = process.env.PORT || 8080;
 app.listen(port, '0.0.0.0', () => {
 	console.log(`[SMFX Proxy] Listening on port ${port}`);
 });
+													 
