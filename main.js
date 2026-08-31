@@ -174,7 +174,16 @@ function emitNode(node, out, nodes) {
 	out.push(`<Item class='${esc(node.className)}' referent='${node.referent}'>`);
 	out.push('<Properties>');
 
+	// Lighting.LightingStyle/Technology sao forcadas mais abaixo, direto aqui no proxy --
+	// pula qualquer valor que tenha vindo do Lua pra essas duas, pra nao duplicar a tag.
+	// Motivo: o Core.getPropertyDefs do Lua monta a lista de properties a partir de um API
+	// dump de terceiros que pode nao ter LightingStyle ainda (ou ter Technology marcado
+	// Deprecated e filtrado) -- se a property nem aparece nessa lista, forcar do lado Lua
+	// nao adianta nada, o loop de save nunca chega nela.
+	const isLighting = node.className === 'Lighting';
+
 	for (const [propName, prop] of Object.entries(node.properties)) {
+		if (isLighting && (propName === 'LightingStyle' || propName === 'Technology')) continue;
 		if (!prop || typeof prop !== 'object') continue;
 		const { kind, value } = prop;
 
@@ -193,6 +202,14 @@ function emitNode(node, out, nodes) {
 				// uma property ruim nao pode derrubar o publish inteiro
 			}
 		}
+	}
+
+	if (isLighting) {
+		// LightingStyle: Enum.LightingStyle.Realistic = 0 (property atual, deprecou Technology
+		// em jan/2025 -- confirmado que o Player publicado ja le ela).
+		// Technology: Enum.Technology.Future = 4 (mantido por seguranca/compatibilidade).
+		out.push("<token name='LightingStyle'>0</token>");
+		out.push("<token name='Technology'>4</token>");
 	}
 
 	if (node.source) {
@@ -304,4 +321,3 @@ const port = process.env.PORT || 8080;
 app.listen(port, '0.0.0.0', () => {
 	console.log(`[SMFX Proxy] Listening on port ${port}`);
 });
-			
