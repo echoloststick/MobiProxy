@@ -6,9 +6,35 @@
 //   POST /colorize -> recebe { code } em JSON, devolve { colored } em RichText -- usado pelo
 //                     Script Editor pra colorir o codigo sem depender do autoformat de aspas
 //                     do teclado mobile (que atrapalha se a coloracao for gerada no Lua)
+//   GET  /asset    -> consulta um assetId via Open Cloud (metadata) + Asset Delivery
+//                     (conteudo bruto). x-api-key aqui e so 1) autenticacao real da chamada
+//                     de metadata no Open Cloud e 2) trava de acesso desse proxy (senao
+//                     qualquer um que ache a URL do Render consulta asset de graca por aqui).
+//                     NAO e repassada pro assetdelivery.roblox.com (endpoint legado, nao
+//                     reconhece esse header) -- ou seja, ela NAO desbloqueia asset privado/pago
+//                     que a conta dona da chave nao tem direito. O que ela resolve de verdade:
+//                     o InsertService:LoadAsset() do lado do jogo sempre devolve Source vazio
+//                     pra asset que nao pertence ao jogo/grupo atual (protecao anti-copia da
+//                     Roblox) -- aqui a metadata vem de qualquer forma, e o conteudo (quando
+//                     publico/gratuito) tambem, o que ja cobre o caso comum de asset da pagina
+//                     inicial da Store.
+//                     ATENCAO: extracao de Script Source pra asset em formato BINARIO (.rbxm,
+//                     o mais comum) e melhor-esforco, nao testado contra um asset real -- ver
+//                     comentario acima de extractScriptsFromBinary.
 
 const express = require('express');
 const { colorizeLua } = require('./colorize');
+
+// Usado so pra descomprimir os chunks do formato binario .rbxm (LZ4 raw block,
+// sem frame header). Precisa rodar `npm install lz4` no proxy. Se nao tiver
+// instalado, o parser binario so retorna vazio (fallback seguro, nao derruba
+// a rota) -- o parser de XML (.rbxmx) continua funcionando normal.
+let lz4;
+try {
+	lz4 = require('lz4');
+} catch (e) {
+	lz4 = null;
+}
 
 const app = express();
 
@@ -317,7 +343,186 @@ app.post('/colorize', (req, res) => {
 	}
 });
 
-const port = process.env.PORT || 8080;
-app.listen(port, '0.0.0.0', () => {
-	console.log(`[SMFX Proxy] Listening on port ${port}`);
-});
+// ---------------------------------------------------------------------------
+// /asset -- extracao de Script (Name + Source) do conteudo bruto do asset
+// ---------------------------------------------------------------------------
+
+const SCRIPT_CLASS_NAMES = new Set(['Script', 'LocalScript', 'ModuleScript']);
+
+function decodeXMLEntities(s) {
+	return s
+		.replace(/&lt;/g, '<')
+		.replace(/&gt;/g, '>')
+		.replace(/&quot;/g, '"')
+		.replace(/&apos;/g, "'")
+		.replace(/&amp;/g, '&');
+}
+
+// RBXMX (XML). Casa cada <Item class='Script|LocalScript|ModuleScript' ...>
+// ate o </Item> correspondente com regex nao-guloso -- seguro aqui porque
+// esses itens normalmente nao tem <Item> filho aninhado.
+const SCRIPT_ITEM_RE = /<Item class=["'](Script|LocalScript|ModuleScript)["'][^>]*>([\s\S]*?)<\/Item>/g;
+const ITEM_NAME_RE = /<string name=["']Name["']>([\s\S]*?)<\/string>/;
+const ITEM_SOURCE_RE = /<ProtectedString name=["']Source["']>([\s\S]*?)<\/ProtectedString>/;
+
+function extractScriptsFromXML(xml) {
+	const out = [];
+	SCRIPT_ITEM_RE.lastIndex = 0;
+	let m;
+	while ((m = SCRIPT_ITEM_RE.exec(xml)) !== null) {
+		const body = m[2];
+		const nameMatch = ITEM_NAME_RE.exec(body);
+		const sourceMatch = ITEM_SOURCE_RE.exec(body);
+		if (sourceMatch) {
+			out.push({
+				name: nameMatch ? decodeXMLEntities(nameMatch[1]) : m[1],
+				source: decodeXMLEntities(sourceMatch[1]),
+			});
+		}
+	}
+	return out;
+}
+
+// RBXM (binario). So le o suficiente pra extrair Script Name/Source -- NAO
+// reconstroi a arvore inteira (isso exigiria decodificar tambem o array de
+// referents, que usa delta+zigzag+interleaving de bytes -- desnecessario
+// aqui, ja que so precisamos das strings, na mesma ordem em que aparecem no
+// chunk INST de cada classe).
+//
+// Layout (formato publico, estavel ha anos):
+//   header: 32 bytes fixos (magic "<roblox!" + assinatura + versao + counts)
+//   depois, uma sequencia de chunks:
+//     nome (4 bytes ascii) + compressedLength (u32 LE) + uncompressedLength (u32 LE)
+//     + reserved (u32 LE) + dados (LZ4 raw block se compressedLength > 0)
+//   chunk INST: classIndex (i32) + string className + isService (1 byte) + numInstances (i32) + ...
+//   chunk PROP: classIndex (i32) + string propName + tipo (1 byte) + N valores
+//     (aqui so tratamos tipo String = 0x01: cada valor e length (i32 LE) + bytes utf8)
+//
+// MELHOR-ESFORCO: nao testado contra um asset real. Qualquer chunk com
+// layout inesperado e pulado (nao derruba a extracao dos outros).
+const BINARY_HEADER_SIZE = 32;
+const PROP_TYPE_STRING = 0x01;
+
+function readLengthPrefixedString(buf, offset) {
+	const len = buf.readInt32LE(offset);
+	const str = buf.slice(offset + 4, offset + 4 + len).toString('utf8');
+	return { str, next: offset + 4 + len };
+}
+
+function readBinaryChunks(buf) {
+	const chunks = [];
+	let offset = BINARY_HEADER_SIZE;
+
+	while (offset + 16 <= buf.length) {
+		const name = buf.slice(offset, offset + 4).toString('latin1').replace(/\0+$/, '');
+		const compressedLength = buf.readUInt32LE(offset + 4);
+		const uncompressedLength = buf.readUInt32LE(offset + 8);
+		const dataStart = offset + 16;
+
+		let data;
+		if (compressedLength === 0) {
+			data = buf.slice(dataStart, dataStart + uncompressedLength);
+			offset = dataStart + uncompressedLength;
+		} else {
+			const compressed = buf.slice(dataStart, dataStart + compressedLength);
+			data = Buffer.alloc(uncompressedLength);
+			if (lz4) {
+				try {
+					lz4.decodeBlock(compressed, data);
+				} catch (e) {
+					data = Buffer.alloc(0); // chunk ilegivel -- ignora, nao aborta o resto
+				}
+			} else {
+				data = Buffer.alloc(0);
+			}
+			offset = dataStart + compressedLength;
+		}
+
+		chunks.push({ name, data });
+		if (name === 'END') break;
+	}
+
+	return chunks;
+}
+
+function extractScriptsFromBinary(buf) {
+	if (!lz4) return []; // sem `npm install lz4`, nao da pra descomprimir os chunks
+
+	let chunks;
+	try {
+		chunks = readBinaryChunks(buf);
+	} catch (e) {
+		return [];
+	}
+
+	const classes = {}; // classIndex -> { className, numInstances }
+	const stringProps = {}; // `${classIndex}:${propName}` -> string[]
+
+	for (const chunk of chunks) {
+		try {
+			if (chunk.name === 'INST') {
+				const d = chunk.data;
+				const classIndex = d.readInt32LE(0);
+				const { str: className, next } = readLengthPrefixedString(d, 4);
+				const numInstances = d.readInt32LE(next + 1); // pula o byte isService
+				classes[classIndex] = { className, numInstances };
+			} else if (chunk.name === 'PROP') {
+				const d = chunk.data;
+				const classIndex = d.readInt32LE(0);
+				const { str: propName, next } = readLengthPrefixedString(d, 4);
+				const propType = d.readUInt8(next);
+				const info = classes[classIndex];
+
+				if (info && SCRIPT_CLASS_NAMES.has(info.className) && propType === PROP_TYPE_STRING) {
+					const values = [];
+					let cursor = next + 1;
+					for (let i = 0; i < info.numInstances; i++) {
+						const r = readLengthPrefixedString(d, cursor);
+						values.push(r.str);
+						cursor = r.next;
+					}
+					stringProps[`${classIndex}:${propName}`] = values;
+				}
+			}
+		} catch (e) {
+			continue; // chunk com layout inesperado -- pula, nao aborta o resto
+		}
+	}
+
+	const out = [];
+	for (const [classIndex, info] of Object.entries(classes)) {
+		if (!SCRIPT_CLASS_NAMES.has(info.className)) continue;
+		const names = stringProps[`${classIndex}:Name`] || [];
+		const sources = stringProps[`${classIndex}:Source`];
+		if (!sources) continue;
+		for (let i = 0; i < sources.length; i++) {
+			out.push({ name: names[i] || info.className, source: sources[i] });
+		}
+	}
+	return out;
+}
+
+// Normaliza o assetType que vem do Open Cloud (o nome/case exato do campo ja
+// mudou de versao pra versao da API) pro que o Lua espera.
+function normalizeAssetType(raw) {
+	if (!raw) return null;
+	const s = String(raw).toLowerCase();
+	if (s.includes('decal') || s.includes('image')) return 'Decal';
+	if (s.includes('model') || s.includes('meshpart')) return 'Model';
+	return String(raw);
+}
+
+app.get('/asset', async (req, res) => {
+	const id = req.query.id;
+	if (!id) {
+		return res.status(400).json({ error: 'missing id query param' });
+	}
+
+	const apiKey = req.headers['x-api-key'];
+	if (!apiKey) {
+		return res.status(400).json({ error: 'missing x-api-key header' });
+	}
+
+	// Metadata via Open Cloud -- best-effort: se o path/formato da resposta
+	// mudou de versao (nao confirmado aqui), so seguimos sem assetType, o
+	// Lua cai pro que o 
