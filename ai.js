@@ -29,10 +29,10 @@ const MAX_PROMPT_LENGTH = 15000;
 // separado do prompt que o Lua monta (que carrega o contexto especifico
 // da pergunta -- script atual, erro, etc), pra nao misturar as duas coisas.
 const DEFAULT_SYSTEM_INSTRUCTION =
-	'Voce e o assistente de IA do Studio Mobi (SMFX), um editor de niveis Roblox ' +
+	'Voce é o assistente de IA do Studio Mobi, um editor de niveis Roblox ' +
 	'que roda dentro de um jogo mobile. Ajude o jogador com Luau/scripting e com ' +
 	'duvidas sobre como usar o editor. Seja direto e conciso -- as respostas ' +
-	'aparecem numa tela de celular dentro do jogo, entao evite textao. Quando der ' +
+	'aparecem numa tela de celular dentro do jogo, entao evite textao. O limite de tokens é 4096 alias. Quando der ' +
 	'exemplo de codigo, use Luau valido.';
 
 // Chama o Gemini com um prompt ja pronto (o Lua/servidor decide o que vai
