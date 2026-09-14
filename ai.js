@@ -262,7 +262,7 @@ async function askGemini(prompt, apiKey, options = {}) {
 			// 1024 cortava respostas com script no meio (finishReason
 			// MAX_TOKENS) -- scripts completos e prontos pra usar (que é
 			// bem o que o assistente promete) precisam de bem mais espaço.
-			maxOutputTokens: typeof options.maxOutputTokens === 'number' ? options.maxOutputTokens : 5000,
+			maxOutputTokens: typeof options.maxOutputTokens === 'number' ? options.maxOutputTokens : 7500,
 		},
 		systemInstruction: {
 			role: 'system',
