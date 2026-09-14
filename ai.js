@@ -59,7 +59,8 @@ Formato dos valores de propriedade no JSON:
 - Color3: {"r":1,"g":0,"b":0} (0 a 1)
 - BrickColor: o nome da cor como string, ex: "Bright red"
 - Enum (Material, PartType, etc): só o nome do item, ex: "SmoothPlastic", "Neon"
-- Instância (Class, ex: Parent): o caminho completo como string, ex: "game/Workspace/Baseplate"
+- Instância (Class, ex: Parent): o caminho completo como string, ex: "game/Workspace/Baseplate".
+Evite mandar muitos comandos para não furar o limite de 4096 tokens.
 `.trim();
 
 // Monta o systemInstruction final: a base (customizada ou a padrão + regras
@@ -261,7 +262,7 @@ async function askGemini(prompt, apiKey, options = {}) {
 			// 1024 cortava respostas com script no meio (finishReason
 			// MAX_TOKENS) -- scripts completos e prontos pra usar (que é
 			// bem o que o assistente promete) precisam de bem mais espaço.
-			maxOutputTokens: typeof options.maxOutputTokens === 'number' ? options.maxOutputTokens : 4096,
+			maxOutputTokens: typeof options.maxOutputTokens === 'number' ? options.maxOutputTokens : 5000,
 		},
 		systemInstruction: {
 			role: 'system',
@@ -323,7 +324,7 @@ async function askGemini(prompt, apiKey, options = {}) {
 	// que aconteceu com maxOutputTokens em 1024. Marca visivelmente em vez
 	// de deixar passar batido.
 	if (finishReason === 'MAX_TOKENS') {
-		finalText += '\n\n[⚠️ resposta cortada por limite de tamanho]';
+		finalText += '\n\n → Response cut off due to token limit.';
 	}
 
 	return { text: finalText, commands, finishReason };
