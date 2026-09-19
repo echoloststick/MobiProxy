@@ -20,7 +20,7 @@ const KEYWORDS = new Set([
 ]);
 const CONSTANTS = new Set(['true', 'false', 'nil']);
 const GLOBALS = new Set([
-	'game', 'workspace', 'script', 'shared', '_G',
+	'game', 'workspace', 'script', 'shared', '_G', '_ENV', 'debug',
 	'string', 'table', 'math', 'task', 'os', 'coroutine', 'utf8', 'buffer',
 	'Instance', 'Enum', 'Vector2', 'Vector3', 'CFrame', 'Color3', 'BrickColor',
 	'UDim', 'UDim2', 'Rect', 'NumberRange', 'NumberSequence', 'ColorSequence',
@@ -29,7 +29,7 @@ const GLOBALS = new Set([
 	'pairs', 'ipairs', 'next', 'pcall', 'xpcall', 'require', 'typeof', 'type',
 	'tostring', 'tonumber', 'print', 'warn', 'error', 'assert', 'select',
 	'unpack', 'rawget', 'rawset', 'rawequal', 'setmetatable', 'getmetatable',
-	'delay', 'spawn', 'wait', 'DateTime',
+	'delay', 'spawn', 'wait', 'tick', 'time', 'elapsedTime', 'DateTime',
 ]);
 
 const PENDING_DO = new Set(['for', 'while']);
@@ -63,14 +63,10 @@ function levenshtein(a, b) {
 	return matrix[b.length][a.length];
 }
 
-// MELHORIA: Agora aceita uma lista de palavras-chave esperadas (contexto)
 function findKeywordSuggestion(word, contextKeywords) {
 	let bestMatch = null;
 	let minDistance = Infinity;
 	
-	// Se o contexto for fornecido, só procuramos nele.
-	// Se não, usamos a lista global, MAS removemos 'end' e 'until' que só devem ser sugeridos
-	// se houver um bloco aberto esperando por eles.
 	const defaultKeywords = SUGGESTION_KEYWORDS.filter(kw => kw !== 'end' && kw !== 'until');
 	const keywordsToCheck = contextKeywords && contextKeywords.size > 0 
 		? [...contextKeywords] 
@@ -90,6 +86,42 @@ function findKeywordSuggestion(word, contextKeywords) {
 		return bestMatch;
 	}
 	return null;
+}
+
+// NOVA FUNÇÃO: Faz uma varredura inicial para descobrir todas as variáveis declaradas no script
+function collectVariables(tokens) {
+	const vars = new Set([...GLOBALS, 'self', '...', '_ENV']);
+	for (let i = 0; i < tokens.length; i++) {
+		const t = tokens[i];
+		if (t.type !== 'word') continue;
+		
+		if (t.text === 'local' || t.text === 'for') {
+			let j = i + 1;
+			while (j < tokens.length && (tokens[j].type === 'word' || tokens[j].text === ',')) {
+				if (tokens[j].type === 'word') vars.add(tokens[j].text);
+				j++;
+			}
+		} else if (t.text === 'function') {
+			let j = i + 1;
+			// Pula o nome da função se não for um método (ex: function foo(...))
+			if (tokens[j] && tokens[j].type === 'word' && tokens[j+1] && tokens[j+1].text !== ':') {
+				vars.add(tokens[j].text);
+				j++;
+			} else if (tokens[j] && tokens[j].type === 'word' && tokens[j+1] && tokens[j+1].text === ':') {
+				// É um método (ex: function obj:metodo(...)), pula o objeto e os dois pontos
+				j += 2;
+			}
+			// Adiciona os parâmetros da função
+			if (tokens[j] && tokens[j].text === '(') {
+				j++;
+				while (j < tokens.length && tokens[j].text !== ')') {
+					if (tokens[j].type === 'word') vars.add(tokens[j].text);
+					j++;
+				}
+			}
+		}
+	}
+	return vars;
 }
 
 function tokenize(code) {
@@ -205,6 +237,7 @@ function checkSyntax(tokens) {
 	const errors = [];
 	const blocks = [];
 	const brackets = [];
+	const knownVars = collectVariables(tokens); // Coleta as variáveis conhecidas
 
 	const pushError = (line, message, suggestion = null) => errors.push({ line, message, suggestion });
 
@@ -239,57 +272,54 @@ function checkSyntax(tokens) {
 		if (t.type !== 'word') continue;
 		const w = t.text;
 
-		// --- DETECÇÃO DE ERROS DE DIGITAÇÃO ---
-		if (!KEYWORDS.has(w) && !CONSTANTS.has(w) && !GLOBALS.has(w) && w !== 'self') {
-			const isVarDeclaration = prevToken && (
-				prevToken.text === 'local' || 
-				prevToken.text === 'function' || 
-				prevToken.text === ','
-			);
+		// --- DETECÇÃO DE VARIÁVEIS E ERROS DE DIGITAÇÃO ---
+		if (!KEYWORDS.has(w) && !CONSTANTS.has(w) && w !== 'self') {
+			const isFieldAccess = prevToken && (prevToken.text === '.' || prevToken.text === ':');
+			const isVarDeclaration = prevToken && (prevToken.text === 'local' || prevToken.text === 'function' || prevToken.text === ',');
 			
-			const nextIsVarChar = nextToken && (
-				nextToken.text === '=' || 
-				nextToken.text === '.' || 
-				nextToken.text === ':' || 
-				nextToken.text === '(' || 
-				nextToken.text === '[' ||
-				nextToken.text === ','
-			);
-			
-			if (!isVarDeclaration && !nextIsVarChar) {
-				// MELHORIA: Coleta o contexto atual de blocos para saber quais palavras-chave são esperadas
-				const expectedKeywords = new Set();
-				const top = blocks[blocks.length - 1];
+			if (!isFieldAccess && !isVarDeclaration && !knownVars.has(w)) {
+				// Verifica se é um contexto de valor (ex: = en, return en, print(en))
+				// Nesses casos, NÃO sugerimos palavras-chave como 'end'
+				const isValueContext = prevToken && (
+					prevToken.text === '=' || prevToken.text === '(' || prevToken.text === ',' || 
+					prevToken.text === 'and' || prevToken.text === 'or' || prevToken.text === 'not' || 
+					prevToken.text === '+' || prevToken.text === '-' || prevToken.text === '*' || 
+					prevToken.text === '/' || prevToken.text === '%' || prevToken.text === '^' || 
+					prevToken.text === '..' || prevToken.text === 'return'
+				);
 				
-				if (top) {
-					if (top.type === 'if') {
-						if (!top.hasThen) expectedKeywords.add('then');
-						expectedKeywords.add('elseif');
-						expectedKeywords.add('else');
-						expectedKeywords.add('end');
-					} else if (top.type === 'for' || top.type === 'while') {
-						if (top.pendingDo) expectedKeywords.add('do');
-						expectedKeywords.add('end');
-					} else if (top.type === 'function') {
-						expectedKeywords.add('end');
-					} else if (top.type === 'do') {
-						expectedKeywords.add('end');
-					} else if (top.type === 'repeat') {
-						expectedKeywords.add('until');
+				let typo = null;
+				if (!isValueContext) {
+					// Coleta o contexto atual de blocos para saber quais palavras-chave são esperadas
+					const expectedKeywords = new Set();
+					const top = blocks[blocks.length - 1];
+					if (top) {
+						if (top.type === 'if') {
+							if (!top.hasThen) expectedKeywords.add('then');
+							expectedKeywords.add('elseif'); expectedKeywords.add('else'); expectedKeywords.add('end');
+						} else if (top.type === 'for' || top.type === 'while') {
+							if (top.pendingDo) expectedKeywords.add('do');
+							expectedKeywords.add('end');
+						} else if (top.type === 'function') {
+							expectedKeywords.add('end');
+						} else if (top.type === 'do') {
+							expectedKeywords.add('end');
+						} else if (top.type === 'repeat') {
+							expectedKeywords.add('until');
+						}
 					}
+					expectedKeywords.add('local'); expectedKeywords.add('function');
+					expectedKeywords.add('if'); expectedKeywords.add('for');
+					expectedKeywords.add('while'); expectedKeywords.add('repeat');
+					
+					typo = findKeywordSuggestion(w, expectedKeywords);
 				}
 				
-				// Palavras-chave globais que fazem sentido mesmo sem bloco aberto
-				expectedKeywords.add('local');
-				expectedKeywords.add('function');
-				expectedKeywords.add('if');
-				expectedKeywords.add('for');
-				expectedKeywords.add('while');
-				expectedKeywords.add('repeat');
-				
-				const typo = findKeywordSuggestion(w, expectedKeywords);
 				if (typo) {
 					pushError(t.line, `Unknown word '${w}'. Did you mean '${typo}'?`, `Did you mean '${typo}'?`);
+				} else {
+					// Se não for erro de digitação e não estiver declarada, é variável desconhecida
+					pushError(t.line, `Unknown variable '${w}'.`, `Declare '${w}' or check for typos.`);
 				}
 			}
 		}
@@ -317,7 +347,6 @@ function checkSyntax(tokens) {
 		} else if (w === 'end') {
 			const top = blocks[blocks.length - 1];
 			if (!top) {
-				// AQUI: Erro para "end" solto, sem bloco aberto (inclui end depois de = ou sinais)
 				pushError(t.line, "Unexpected 'end': no matching block to close");
 			} else if (top.type === 'repeat') {
 				pushError(t.line, "Unexpected 'end': a 'repeat' block must be closed with 'until'");
