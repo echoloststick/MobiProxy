@@ -10,7 +10,7 @@ const CORES = {
 	number: '#B5CEA8',
 	global: '#4EC9B0',
 	self: '#9CDCFE',
-	error: '#F44747',     // linha inteira quando o syntax check acha problema nela
+	error: '#F44747',
 };
 
 const KEYWORDS = new Set([
@@ -36,7 +36,6 @@ const PENDING_DO = new Set(['for', 'while']);
 const BRACKET_OPEN = { '(': ')', '[': ']', '{': '}' };
 const BRACKET_CLOSE = { ')': '(', ']': '[', '}': '{' };
 
-// Palavras-chave que podem ser alvo de erros de digitação
 const SUGGESTION_KEYWORDS = [...KEYWORDS, ...CONSTANTS];
 
 function escapeRichText(s) {
@@ -47,9 +46,6 @@ function wrap(text, color) {
 	return `<font color='${color}'>${escapeRichText(text)}</font>`;
 }
 
-// --- FUNÇÕES PARA SUGESTÃO DE DIGITAÇÃO ---
-
-// Calcula a distância de Levenshtein (quantas edições são necessárias para transformar 'a' em 'b')
 function levenshtein(a, b) {
 	const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
 	for (let i = 0; i <= a.length; i++) matrix[0][i] = i;
@@ -58,21 +54,29 @@ function levenshtein(a, b) {
 		for (let i = 1; i <= a.length; i++) {
 			const indicator = a[i - 1] === b[j - 1] ? 0 : 1;
 			matrix[j][i] = Math.min(
-				matrix[j][i - 1] + 1, // deleção
-				matrix[j - 1][i] + 1, // inserção
-				matrix[j - 1][i - 1] + indicator // substituição
+				matrix[j][i - 1] + 1,
+				matrix[j - 1][i] + 1,
+				matrix[j - 1][i - 1] + indicator
 			);
 		}
 	}
 	return matrix[b.length][a.length];
 }
 
-// Encontra a palavra-chave mais próxima da palavra digitada, se houver
-function findKeywordSuggestion(word) {
+// MELHORIA: Agora aceita uma lista de palavras-chave esperadas (contexto)
+function findKeywordSuggestion(word, contextKeywords) {
 	let bestMatch = null;
 	let minDistance = Infinity;
 	
-	for (const kw of SUGGESTION_KEYWORDS) {
+	// Se o contexto for fornecido, só procuramos nele.
+	// Se não, usamos a lista global, MAS removemos 'end' e 'until' que só devem ser sugeridos
+	// se houver um bloco aberto esperando por eles.
+	const defaultKeywords = SUGGESTION_KEYWORDS.filter(kw => kw !== 'end' && kw !== 'until');
+	const keywordsToCheck = contextKeywords && contextKeywords.size > 0 
+		? [...contextKeywords] 
+		: defaultKeywords;
+
+	for (const kw of keywordsToCheck) {
 		if (Math.abs(word.length - kw.length) > 2) continue;
 		const dist = levenshtein(word, kw);
 		if (dist < minDistance) {
@@ -81,15 +85,12 @@ function findKeywordSuggestion(word) {
 		}
 	}
 	
-	// Limiar de tolerância: 1 erro para palavras curtas, 2 para palavras longas
-	const threshold = word.length <= 3 ? 1 : 2;
+	const threshold = word.length <= 5 ? 1 : 2;
 	if (minDistance <= threshold && minDistance > 0) {
 		return bestMatch;
 	}
 	return null;
 }
-
-// --- FIM DAS FUNÇÕES DE SUGESTÃO ---
 
 function tokenize(code) {
 	const tokens = [];
@@ -200,26 +201,25 @@ function colorizeLua(code) {
 	return out;
 }
 
-// Checagem de sintaxe leve: casamento de blocos (if/for/while/function/do -> end,
-// repeat -> until) e de brackets ((), [], {}).
 function checkSyntax(tokens) {
 	const errors = [];
 	const blocks = [];
 	const brackets = [];
 
-	// Agora aceita uma sugestão opcional
 	const pushError = (line, message, suggestion = null) => errors.push({ line, message, suggestion });
 
-	let prevToken = null;
+	for (let i = 0; i < tokens.length; i++) {
+		const t = tokens[i];
+		const prevToken = tokens[i - 1];
+		const nextToken = tokens[i + 1];
 
-	for (const t of tokens) {
 		if (t.type === 'comment' || t.type === 'string') {
 			if (t.unterminated) {
 				const kind = t.type === 'comment' ? 'Unterminated comment' : 'Unterminated string';
 				const detail = t.text.startsWith('--[') || t.text.startsWith('[') ? "missing closing ']'" : 'missing closing quote';
 				pushError(t.line, `${kind}: ${detail}`);
 			}
-			continue; // Não atualiza prevToken para não atrapalhar a detecção de variáveis
+			continue;
 		}
 
 		if (t.type === 'other') {
@@ -233,29 +233,61 @@ function checkSyntax(tokens) {
 					brackets.pop();
 				}
 			}
-			prevToken = t;
 			continue;
 		}
 
-		if (t.type !== 'word') {
-			prevToken = t;
-			continue;
-		}
-
+		if (t.type !== 'word') continue;
 		const w = t.text;
 
 		// --- DETECÇÃO DE ERROS DE DIGITAÇÃO ---
-		// Se não for uma palavra-chave conhecida, global ou 'self', verificamos se é um typo.
 		if (!KEYWORDS.has(w) && !CONSTANTS.has(w) && !GLOBALS.has(w) && w !== 'self') {
-			// Evita dar erro se for uma declaração de variável (ex: local en = 5)
 			const isVarDeclaration = prevToken && (
 				prevToken.text === 'local' || 
 				prevToken.text === 'function' || 
 				prevToken.text === ','
 			);
 			
-			if (!isVarDeclaration) {
-				const typo = findKeywordSuggestion(w);
+			const nextIsVarChar = nextToken && (
+				nextToken.text === '=' || 
+				nextToken.text === '.' || 
+				nextToken.text === ':' || 
+				nextToken.text === '(' || 
+				nextToken.text === '[' ||
+				nextToken.text === ','
+			);
+			
+			if (!isVarDeclaration && !nextIsVarChar) {
+				// MELHORIA: Coleta o contexto atual de blocos para saber quais palavras-chave são esperadas
+				const expectedKeywords = new Set();
+				const top = blocks[blocks.length - 1];
+				
+				if (top) {
+					if (top.type === 'if') {
+						if (!top.hasThen) expectedKeywords.add('then');
+						expectedKeywords.add('elseif');
+						expectedKeywords.add('else');
+						expectedKeywords.add('end');
+					} else if (top.type === 'for' || top.type === 'while') {
+						if (top.pendingDo) expectedKeywords.add('do');
+						expectedKeywords.add('end');
+					} else if (top.type === 'function') {
+						expectedKeywords.add('end');
+					} else if (top.type === 'do') {
+						expectedKeywords.add('end');
+					} else if (top.type === 'repeat') {
+						expectedKeywords.add('until');
+					}
+				}
+				
+				// Palavras-chave globais que fazem sentido mesmo sem bloco aberto
+				expectedKeywords.add('local');
+				expectedKeywords.add('function');
+				expectedKeywords.add('if');
+				expectedKeywords.add('for');
+				expectedKeywords.add('while');
+				expectedKeywords.add('repeat');
+				
+				const typo = findKeywordSuggestion(w, expectedKeywords);
 				if (typo) {
 					pushError(t.line, `Unknown word '${w}'. Did you mean '${typo}'?`, `Did you mean '${typo}'?`);
 				}
@@ -285,6 +317,7 @@ function checkSyntax(tokens) {
 		} else if (w === 'end') {
 			const top = blocks[blocks.length - 1];
 			if (!top) {
+				// AQUI: Erro para "end" solto, sem bloco aberto (inclui end depois de = ou sinais)
 				pushError(t.line, "Unexpected 'end': no matching block to close");
 			} else if (top.type === 'repeat') {
 				pushError(t.line, "Unexpected 'end': a 'repeat' block must be closed with 'until'");
@@ -298,23 +331,19 @@ function checkSyntax(tokens) {
 		} else if (w === 'elseif') {
 			const top = blocks[blocks.length - 1];
 			if (!top || top.type !== 'if') pushError(t.line, `'${w}' outside of an 'if' block`);
-			if (top && top.type === 'if') top.hasThen = false; // elseif precisa de um novo 'then'
+			if (top && top.type === 'if') top.hasThen = false;
 		} else if (w === 'else') {
 			const top = blocks[blocks.length - 1];
 			if (!top || top.type !== 'if') pushError(t.line, `'${w}' outside of an 'if' block`);
 		}
-
-		prevToken = t;
 	}
 
-	// --- ERROS DE BLOCOS NÃO FECHADOS ---
 	for (const open of blocks) {
 		const needs = open.type === 'repeat' ? "'until'" : "'end'";
 		let msg = `Unclosed '${open.type}' block (started on line ${open.line}): missing ${needs}.`;
 		
-		// Tenta achar um erro de digitação que possa ser a causa do bloco não fechado
 		const expectedKw = open.type === 'repeat' ? 'until' : 'end';
-		const typoToken = tokens.find(t => t.type === 'word' && findKeywordSuggestion(t.text) === expectedKw);
+		const typoToken = tokens.find(t => t.type === 'word' && findKeywordSuggestion(t.text, new Set([expectedKw])) === expectedKw);
 		
 		if (typoToken) {
 			msg += ` Did you mean '${expectedKw}' instead of '${typoToken.text}' on line ${typoToken.line}?`;
