@@ -62,6 +62,16 @@ app.use(express.json({ limit: '50mb' })); // projeto grande gera JSON grande
 // Rotas
 // ---------------------------------------------------------------------------
 
+// Health check -- usado por uptime monitors / load balancers pra saber se
+// o processo esta vivo. Responde sempre "ok" em texto puro, sem tocar em
+// nenhuma dependencia externa (Gemini, Open Cloud, etc): e' so um ping no
+// proprio Express. Fica ANTES das outras rotas de proposito, pra nao
+// gastar o body parser nem nada pesado num endpoint chamado a cada X
+// segundos por monitor.
+app.get('/health', (req, res) => {
+	res.type('text/plain').send('ok');
+});
+
 app.post('/publish', async (req, res) => {
 	const payload = req.body;
 	if (!payload || !payload.objects || !payload.url) {
