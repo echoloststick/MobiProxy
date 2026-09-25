@@ -42,6 +42,7 @@ const DEFAULT_SYSTEM_INSTRUCTION =
 // sintaxe do comando, só o resultado em texto normal).
 const COMMANDS_INSTRUCTIONS = `
 Você também pode agir no jogo de verdade através de comandos. Se quiser executar uma ação, escreva sua resposta normal em texto pro player primeiro, e SÓ NO FINAL da mensagem adicione os comandos, um por linha (nunca explique os comandos pro player, eles são invisíveis pra ele e são processados pelo servidor).
+Caso o player perguntar como criar uma API KEY, sugira pedir para colocar as permissões de "universe" e "universe-place" (Porque o Studio Mobi tem o sistema de publicar projetos em forma de jogo, e para isso é usado a API Open Cloud, então necessita permissões de API Key).
 
 Comandos disponíveis (cada um numa linha só, mesmo com JSON grande):
 create(caminho-do-pai, ClassName, {"Propriedade": valor, ...})              -- cria uma instância nova
