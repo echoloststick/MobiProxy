@@ -164,19 +164,24 @@ function emitNode(node, out, nodes) {
 	out.push(`<Item class='${esc(node.className)}' referent='${node.referent}'>`);
 	out.push('<Properties>');
 
-	// Lighting.LightingStyle/Technology e MaterialService.Use2022Materials sao forcadas
-	// mais abaixo, direto aqui no proxy -- pula qualquer valor que tenha vindo do Lua pra
-	// essas properties, pra nao duplicar a tag.
-	// Motivo (mesmo do Lighting): o Core.getPropertyDefs do Lua monta a lista de properties
-	// a partir de um API dump de terceiros que pode nao ter essas properties ainda (ou ter
-	// marcado Deprecated e filtrado) -- se a property nem aparece nessa lista, forcar do
+	// Properties "forcadas" por classe -- pulamos qualquer valor que tenha vindo do Lua
+	// pra elas, e injetamos a tag correta la embaixo. Motivo (mesmo do Lighting):
+	// o Core.getPropertyDefs do Lua monta a lista de properties a partir de um API
+	// dump de terceiros que pode nao ter essas properties ainda (ou ter marcado
+	// Deprecated e filtrado) -- se a property nem aparece nessa lista, forcar do
 	// lado Lua nao adianta nada, o loop de save nunca chega nela.
+	//
+	//  - Lighting.LightingStyle / Lighting.Technology
+	//  - MaterialService.Use2022MaterialsXml
+	//  - Terrain.Decoration
 	const isLighting = node.className === 'Lighting';
 	const isMaterialService = node.className === 'MaterialService';
+	const isTerrain = node.className === 'Terrain';
 
 	for (const [propName, prop] of Object.entries(node.properties)) {
 		if (isLighting && (propName === 'LightingStyle' || propName === 'Technology')) continue;
-		if (isMaterialService && propName === 'Use2022Materials') continue;
+		if (isMaterialService && propName === 'Use2022MaterialsXml') continue;
+		if (isTerrain && propName === 'Decoration') continue;
 		if (!prop || typeof prop !== 'object') continue;
 		const { kind, value } = prop;
 
@@ -206,9 +211,15 @@ function emitNode(node, out, nodes) {
 	}
 
 	if (isMaterialService) {
-		// Use2022Materials = true -- materiais PBR de 2022 (Enum.MaterialService.Use2022Materials).
+		// Use2022MaterialsXml = true -- materiais PBR de 2022.
 		// Forcado aqui pra nao depender do API dump do Lua ter essa property.
 		out.push("<bool name='Use2022MaterialsXml'>true</bool>");
+	}
+
+	if (isTerrain) {
+		// Decoration = true -- liga a decoracao do terreno (grama, etc).
+		// Forcado aqui pelo mesmo motivo das outras: pode nem aparecer no API dump do Lua.
+		out.push("<bool name='Decoration'>true</bool>");
 	}
 
 	if (node.source) {
@@ -226,7 +237,7 @@ function buildRBXLX(objects) {
 	// Garante que o MaterialService exista como service raiz, mesmo que o Lua nao o
 	// mande no dict achatado (ele nao aparece naturalmente no DataModel ate ser
 	// tocado, e o loop de save do Lua so emite o que ve). Sem isso, o proxy nao
-	// teria onde pendurar o Use2022Materials forcado.
+	// teria onde pendurar o Use2022MaterialsXml forcado.
 	let objectsForTree = objects;
 	const hasMaterialService = Object.values(objects).some(
 		(d) => d && d.className === 'MaterialService'
