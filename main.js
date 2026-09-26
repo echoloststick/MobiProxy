@@ -26,13 +26,14 @@
 //                     precisa disso pra montar o seletor.
 //   GET  /gameinfo -> recebe universeId, devolve { name, icon } pra UM jogo. Usado pelo
 //                     PublishSystem logo apos publicar, pra disparar o BindableEvent SetGame com
-//                     dado de exibicao (o icone e' a imageUrl de thumbnails.roblox.com -- CDN
-//                     rbxcdn.com, dominio aprovado pela Roblox pra conteudo https:// direto num
-//                     ImageLabel.Image, entao o Lua nao precisa de asset id nenhum aqui).
+//                     dado de exibicao. O icone e' uma URL rbxthumb://
+//                     (rbxthumb://type=GameIcon&id={universeId}&w=150&h=150), que o proprio
+//                     client do Roblox resolve direto num ImageLabel.Image -- sem precisar
+//                     bater em thumbnails.roblox.com nem devolver URL de CDN nenhuma.
 //   GET  /playergames -> mesma paginacao/filtro do /games, mas devolve { id, name, icon } por
-//                     jogo (icone buscado em lote via thumbnails.roblox.com pra todos os
-//                     universeIds encontrados numa unica chamada extra). Usado pelo
-//                     RemoteFunction GetPlayerGames pra montar a aba "Meus Jogos" do player.
+//                     jogo (icone montado como rbxthumb:// a partir do universeId de cada jogo,
+//                     sem chamada extra a CDN). Usado pelo RemoteFunction GetPlayerGames pra
+//                     montar a aba "Meus Jogos" do player.
 //   GET  /asset    -> consulta um assetId via Open Cloud (metadata, opcional) + Asset Delivery
 //                     (conteudo bruto). A API key (x-api-key) vem do PLAYER, repassada pelo
 //                     Lua a partir do RemoteEvent que manda o id do asset -- se o player nao
@@ -146,7 +147,6 @@ app.get('/get', async (req, res) => {
 // mesmo assim -- e o que a rota /playergames abaixo aproveita de proposito).
 const GAMES_PAGE_LIMIT = 50;
 const MAX_GAMES_PAGES = 10; // ate 500 jogos -- suficiente pra qualquer criador na pratica
-const ICON_BATCH_SIZE = 100; // limite pratico de universeIds por chamada em /v1/games/icons
 
 async function fetchUserGames(userId) {
 	const games = [];
@@ -178,33 +178,12 @@ async function fetchUserGames(userId) {
 	return games;
 }
 
-// Busca o icone (URL de CDN, ja pronta pro ImageLabel.Image -- rbxcdn.com e' dominio aprovado
-// pela Roblox pra conteudo https://) de varios universeIds em lote, em vez de uma chamada por
-// jogo. Devolve um Map<universeId numerico, imageUrl>; id sem icone pronto fica de fora do Map.
-async function fetchGameIcons(universeIds) {
-	const iconById = new Map();
-
-	for (let i = 0; i < universeIds.length; i += ICON_BATCH_SIZE) {
-		const batch = universeIds.slice(i, i + ICON_BATCH_SIZE);
-		try {
-			const url = `https://thumbnails.roblox.com/v1/games/icons?universeIds=${batch.join(',')}&size=150x150&format=Png&isCircular=false`;
-			const iconRes = await fetch(url);
-			if (!iconRes.ok) {
-				console.warn(`[SMFX Proxy] fetchGameIcons falhou pro lote iniciando em ${i}: ${iconRes.status}`);
-				continue;
-			}
-			const body = await iconRes.json();
-			for (const entry of body.data || []) {
-				if (entry && entry.state === 'Completed' && entry.imageUrl) {
-					iconById.set(entry.targetId, entry.imageUrl);
-				}
-			}
-		} catch (e) {
-			console.warn(`[SMFX Proxy] fetchGameIcons request falhou pro lote iniciando em ${i}:`, e.message);
-		}
-	}
-
-	return iconById;
+// rbxthumb:// e' um esquema que o PROPRIO client do Roblox resolve -- nao
+// precisa bater em thumbnails.roblox.com nem devolver URL de CDN. Pro tipo
+// GameIcon, o "id" e' o universeId do jogo. Se o jogo ainda nao tiver icone
+// aprovado/moderado, o client mostra o placeholder padrao do Roblox.
+function gameIconThumb(universeId, size = 150) {
+	return `rbxthumb://type=GameIcon&id=${universeId}&w=${size}&h=${size}`;
 }
 
 app.get('/games', async (req, res) => {
@@ -223,8 +202,9 @@ app.get('/games', async (req, res) => {
 });
 
 // Nome + icone de UM universe, pro PublishSystem disparar o BindableEvent SetGame logo apos
-// publicar (o Lua so tem o universeId/placeId nesse momento -- nome e icone dependem de
-// dominios *.roblox.com que o HttpService do jogo nao alcanca direto).
+// publicar (o Lua so tem o universeId/placeId nesse momento -- nome depende de games.roblox.com,
+// que o HttpService do jogo nao alcanca direto; o icone e montado como rbxthumb:// a partir do
+// universeId e resolvido pelo proprio client, sem chamada extra a CDN nenhuma).
 app.get('/gameinfo', async (req, res) => {
 	const universeId = req.query.universeId;
 	if (!universeId || !/^\d+$/.test(String(universeId))) {
@@ -247,15 +227,14 @@ app.get('/gameinfo', async (req, res) => {
 		console.warn(`[SMFX Proxy] /gameinfo nome request falhou pro universeId ${universeId}:`, e.message);
 	}
 
-	const iconById = await fetchGameIcons([Number(universeId)]);
-	const icon = iconById.get(Number(universeId)) || null;
+	const icon = gameIconThumb(universeId);
 
 	res.json({ name, icon, placeId });
 });
 
 // Jogos do player (publicados/limitados-a-amigos, ver comentario de /games acima) pra aba
-// "Meus Jogos": mesma paginacao do /games, mas tambem busca o icone de cada jogo -- em lote,
-// numa unica chamada a /v1/games/icons pra todos os universeIds encontrados.
+// "Meus Jogos": mesma paginacao do /games, mas tambem monta o icone de cada jogo como
+// rbxthumb:// a partir do universeId -- sem chamada extra a thumbnails.roblox.com.
 app.get('/playergames', async (req, res) => {
 	const userId = req.query.userId;
 	if (!userId || !/^\d+$/.test(String(userId))) {
@@ -264,11 +243,8 @@ app.get('/playergames', async (req, res) => {
 
 	try {
 		const games = await fetchUserGames(userId);
-		if (games.length > 0) {
-			const iconById = await fetchGameIcons(games.map((g) => g.id));
-			for (const game of games) {
-				game.icon = iconById.get(game.id) || null;
-			}
+		for (const game of games) {
+			game.icon = gameIconThumb(game.id);
 		}
 		res.json({ games });
 	} catch (e) {
@@ -456,7 +432,8 @@ app.get('/asset', async (req, res) => {
 	}
 
 	let format = null;
-	let trees = []; // arvore completa (classe+propriedades+refs+filhos), pra XML e BINARIO
+	let trees = []; // arvore completa (classe+propriedades+ref
+		(classe+propriedades+refs+filhos), pra XML e BINARIO
 	const hasContent = !!(buf && buf.length > 0);
 
 	if (hasContent) {
