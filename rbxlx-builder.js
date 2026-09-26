@@ -164,16 +164,19 @@ function emitNode(node, out, nodes) {
 	out.push(`<Item class='${esc(node.className)}' referent='${node.referent}'>`);
 	out.push('<Properties>');
 
-	// Lighting.LightingStyle/Technology sao forcadas mais abaixo, direto aqui no proxy --
-	// pula qualquer valor que tenha vindo do Lua pra essas duas, pra nao duplicar a tag.
-	// Motivo: o Core.getPropertyDefs do Lua monta a lista de properties a partir de um API
-	// dump de terceiros que pode nao ter LightingStyle ainda (ou ter Technology marcado
-	// Deprecated e filtrado) -- se a property nem aparece nessa lista, forcar do lado Lua
-	// nao adianta nada, o loop de save nunca chega nela.
+	// Lighting.LightingStyle/Technology e MaterialService.Use2022Materials sao forcadas
+	// mais abaixo, direto aqui no proxy -- pula qualquer valor que tenha vindo do Lua pra
+	// essas properties, pra nao duplicar a tag.
+	// Motivo (mesmo do Lighting): o Core.getPropertyDefs do Lua monta a lista de properties
+	// a partir de um API dump de terceiros que pode nao ter essas properties ainda (ou ter
+	// marcado Deprecated e filtrado) -- se a property nem aparece nessa lista, forcar do
+	// lado Lua nao adianta nada, o loop de save nunca chega nela.
 	const isLighting = node.className === 'Lighting';
+	const isMaterialService = node.className === 'MaterialService';
 
 	for (const [propName, prop] of Object.entries(node.properties)) {
 		if (isLighting && (propName === 'LightingStyle' || propName === 'Technology')) continue;
+		if (isMaterialService && propName === 'Use2022Materials') continue;
 		if (!prop || typeof prop !== 'object') continue;
 		const { kind, value } = prop;
 
@@ -202,6 +205,12 @@ function emitNode(node, out, nodes) {
 		out.push("<token name='Technology'>4</token>");
 	}
 
+	if (isMaterialService) {
+		// Use2022Materials = true -- materiais PBR de 2022 (Enum.MaterialService.Use2022Materials).
+		// Forcado aqui pra nao depender do API dump do Lua ter essa property.
+		out.push("<bool name='Use2022Materials'>true</bool>");
+	}
+
 	if (node.source) {
 		out.push(`<ProtectedString name='Source'>${esc(node.source)}</ProtectedString>`);
 	}
@@ -214,7 +223,26 @@ function emitNode(node, out, nodes) {
 }
 
 function buildRBXLX(objects) {
-	const { roots, nodes } = buildTree(objects);
+	// Garante que o MaterialService exista como service raiz, mesmo que o Lua nao o
+	// mande no dict achatado (ele nao aparece naturalmente no DataModel ate ser
+	// tocado, e o loop de save do Lua so emite o que ve). Sem isso, o proxy nao
+	// teria onde pendurar o Use2022Materials forcado.
+	let objectsForTree = objects;
+	const hasMaterialService = Object.values(objects).some(
+		(d) => d && d.className === 'MaterialService'
+	);
+	if (!hasMaterialService) {
+		// ID sintetico com prefixo que nao colide com os IDs numericos do Lua.
+		objectsForTree = {
+			...objects,
+			__MaterialService: {
+				className: 'MaterialService',
+				properties: {},
+			},
+		};
+	}
+
+	const { roots, nodes } = buildTree(objectsForTree);
 
 	for (const root of roots) sortChildrenRecursive(root);
 	roots.sort((a, b) => priorityOf(a.className) - priorityOf(b.className));
