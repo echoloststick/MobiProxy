@@ -208,7 +208,7 @@ function emitNode(node, out, nodes) {
 	if (isMaterialService) {
 		// Use2022Materials = true -- materiais PBR de 2022 (Enum.MaterialService.Use2022Materials).
 		// Forcado aqui pra nao depender do API dump do Lua ter essa property.
-		out.push("<bool name='Use2022Materials'>true</bool>");
+		out.push("<bool name='Use2022MaterialsXml'>true</bool>");
 	}
 
 	if (node.source) {
