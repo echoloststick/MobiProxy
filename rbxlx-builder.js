@@ -266,7 +266,7 @@ function emitNode(node, out, nodes) {
 	out.push('</Item>');
 }
 
-function buildRBXLX(objects) {
+function build(objects) {
 	// Garante que o MaterialService exista como service raiz, mesmo que o Lua nao o
 	// mande no dict achatado (ele nao aparece naturalmente no DataModel ate ser
 	// tocado). Sem isso, o proxy nao teria onde pendurar o Use2022MaterialsXml forcado.
@@ -301,12 +301,17 @@ function buildRBXLX(objects) {
 	];
 	for (const root of roots) emitNode(root, out, nodes);
 	out.push('</roblox>');
-	return out.join('');
+	return { xml: out.join(''), items: counter.n };
+}
+
+function buildRBXLX(objects) {
+	return build(objects).xml;
 }
 
 // Compatibilidade com main.js que ainda importa buildRBXLXReport.
 function buildRBXLXReport(objects) {
-	return { xml: buildRBXLX(objects), stats: {} };
+	const { xml, items } = build(objects);
+	return { xml, stats: { items, bytes: Buffer.byteLength(xml, 'utf8') } };
 }
 
 module.exports = { buildRBXLX, buildRBXLXReport };
