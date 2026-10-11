@@ -1,6 +1,7 @@
 // SMFX Publish Proxy (Node.js / Express)
 // Rotas:
-//   POST /publish  -> recebe { url, objects } em JSON, monta o RBXLX e repassa pro Open Cloud
+//   POST /publish  -> recebe { url, objects, defaults } em JSON, monta o place (RBXL binario; RBXLX como
+//                     fallback) e repassa pro Open Cloud
 //   GET  /get      -> proxy generico de leitura (usado pra resolver universeId/rootPlaceId,
 //                     que o HttpService do jogo nao alcanca direto por serem dominios *.roblox.com)
 //   POST /colorize -> recebe { code } em JSON, devolve { colored } em RichText -- usado pelo
@@ -67,11 +68,11 @@
 
 const express = require('express');
 const zlib = require('zlib');
-const crypto = require('crypto');
 const { colorizeLua, colorizeWithErrors } = require('./colorize');
 const { askGemini, MAX_PROMPT_LENGTH: MAX_AI_PROMPT_LENGTH } = require('./ai');
 const { formatAIText } = require('./format');
-const { buildRBXLXReport } = require('./rbxlx-builder');
+const { buildRBXLX } = require('./rbxlx-builder');
+const { buildRBXL } = require('./rbxl-builder');
 const { extractAssetTreesFromXML, extractAssetTreesFromBinary } = require('./asset-parsers');
 
 const app = express();
@@ -92,79 +93,48 @@ app.get('/health', (req, res) => {
 	res.type('text/plain').send('ok');
 });
 
-const DEBUG_XML_TTL_MS = 30 * 60 * 1000;
-const DEBUG_XML_MAX_ENTRIES = 3;
-const debugXml = new Map();
-
-function storeDebugXml(xml) {
-	const now = Date.now();
-	for (const [key, entry] of debugXml) {
-		if (entry.expires <= now) debugXml.delete(key);
-	}
-	while (debugXml.size >= DEBUG_XML_MAX_ENTRIES) {
-		debugXml.delete(debugXml.keys().next().value);
-	}
-	const id = crypto.randomBytes(6).toString('hex');
-	debugXml.set(id, { xml, expires: now + DEBUG_XML_TTL_MS });
-	return id;
-}
-
-app.get('/debug/xml/:id', (req, res) => {
-	const entry = debugXml.get(String(req.params.id));
-	if (!entry || entry.expires <= Date.now()) {
-		return res.status(404).type('text/plain').send('not found');
-	}
-	res.set('Content-Disposition', 'attachment; filename="smfx-publish.rbxlx"');
-	res.type('application/xml').send(entry.xml);
-});
-
 app.post('/publish', async (req, res) => {
 	const payload = req.body;
 	if (!payload || !payload.objects || !payload.url) {
 		return res.status(400).json({ error: 'missing objects or url in JSON body' });
 	}
 
-	let xml;
-	let stats;
-	try {
-		({ xml, stats } = buildRBXLXReport(payload.objects));
-	} catch (e) {
-		return res.status(500).json({ error: `failed to build xml: ${e.message}` });
+	// Binary .rbxl is the default; SMFX_PUBLISH_FORMAT=xml (or payload.format = 'xml') forces RBXLX.
+	// If the binary build throws, the same objects are published as RBXLX instead.
+	let fileBody;
+	let contentType;
+	if (process.env.SMFX_PUBLISH_FORMAT !== 'xml' && payload.format !== 'xml') {
+		try {
+			fileBody = buildRBXL(payload.objects, payload.defaults).buffer;
+			contentType = 'application/octet-stream';
+		} catch (e) {
+			console.error(`[SMFX Proxy] Binary place build failed, falling back to RBXLX: ${e.message}`);
+		}
 	}
-	console.log(`[SMFX Proxy] /publish built ${stats.items} item(s), ${stats.bytes} bytes, ${stats.orphanCount} orphan(s), ${stats.unreachable} unreachable, ${stats.droppedProps} dropped prop(s), ${stats.sanitizedChars} sanitized char(s)`);
+	if (!fileBody) {
+		try {
+			fileBody = buildRBXLX(payload.objects);
+			contentType = 'application/xml';
+		} catch (e) {
+			return res.status(500).json({ error: `failed to build the place file: ${e.message}` });
+		}
+	}
 
 	const apiKey = req.headers['x-api-key'];
 	if (!apiKey) {
 		return res.status(400).json({ error: 'missing x-api-key header' });
 	}
 
-	const debugId = payload.debug === true ? storeDebugXml(xml) : null;
-
 	try {
 		const upstream = await fetch(payload.url, {
 			method: 'POST',
-			headers: { 'x-api-key': apiKey, 'Content-Type': 'application/xml' },
-			body: xml,
+			headers: { 'x-api-key': apiKey, 'Content-Type': contentType },
+			body: fileBody,
 		});
 		const body = await upstream.text();
-		if (!upstream.ok) {
-			console.warn(`[SMFX Proxy] /publish rejected by Open Cloud: ${upstream.status} ${body}`);
-			res.status(upstream.status);
-			res.set('Content-Type', upstream.headers.get('content-type') || 'application/json');
-			return res.send(body);
-		}
-
-		let versionNumber = null;
-		try {
-			const parsed = JSON.parse(body);
-			versionNumber = parsed.versionNumber != null ? parsed.versionNumber : null;
-		} catch (e) {
-			versionNumber = null;
-		}
-		if (versionNumber == null) {
-			console.warn(`[SMFX Proxy] /publish accepted without a versionNumber: ${body}`);
-		}
-		res.json({ versionNumber, stats, debugId });
+		res.status(upstream.status);
+		res.set('Content-Type', upstream.headers.get('content-type') || 'application/json');
+		res.send(body);
 	} catch (e) {
 		res.status(502).json({ error: `upstream request failed: ${e.message}` });
 	}
