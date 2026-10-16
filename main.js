@@ -10,6 +10,9 @@
 //   POST /ai       -> recebe { prompt } (ja pronto, montado pelo Lua) + header x-api-key com
 //                     a key do Gemini (mandada pelo Script do SERVIDOR do jogo, nunca por um
 //                     LocalScript), repassa pro Gemini e devolve { response } ou { error}.
+//                     Opcionalmente aceita { model, link } no body (IA personalizada do player): link e'
+//                     um template com {model} e {api}, que o proxy preenche com o model do body e a key
+//                     do header x-api-key. Sem model/link, usa os padroes de ai.js.
 //                     Logica isolada em ai.js. O proxy nao guarda a key em lugar nenhum
 //                     (nem env var) -- so repassa e esquece, igual o x-api-key de /publish.
 //   POST /format   -> recebe { text } (a resposta CRUA da IA) e devolve { richtext }, o mesmo
@@ -303,7 +306,7 @@ app.post('/colorize', (req, res) => {
 // LocalScript, que qualquer explorer consegue abrir). O proxy nao guarda
 // essa key em lugar nenhum, nem env var: so repassa pro Gemini e esquece.
 app.post('/ai', async (req, res) => {
-	const { prompt, selection, model, temperature, maxOutputTokens, systemInstruction } = req.body || {};
+	const { prompt, selection, model, link, temperature, maxOutputTokens, systemInstruction } = req.body || {};
 	if (typeof prompt !== 'string' || prompt.trim() === '') {
 		return res.status(400).json({ error: "campo 'prompt' obrigatorio" });
 	}
@@ -319,6 +322,7 @@ app.post('/ai', async (req, res) => {
 	try {
 		const { text, commands, finishReason } = await askGemini(prompt, apiKey, {
 			model,
+			link,
 			temperature,
 			maxOutputTokens,
 			systemInstruction,
@@ -327,7 +331,7 @@ app.post('/ai', async (req, res) => {
 		res.json({ response: text, commands, finishReason });
 	} catch (e) {
 		console.warn('[SMFX Proxy] /ai falhou:', e.message);
-		res.status(502).json({ error: e.message });
+		res.status(e.statusCode || 502).json({ error: e.message });
 	}
 });
 

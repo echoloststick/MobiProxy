@@ -16,7 +16,13 @@
 // customizados de temperature/top-K/top-P (nao da erro, so ignora), entao
 // o generationConfig abaixo continua inofensivo mesmo que isso mude de novo.
 const DEFAULT_MODEL = 'gemini-3.6-flash';
-const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+const net = require('net');
+// Template do link padrao. {model} e {api} sao trocados em buildRequestUrl().
+// O link tambem pode vir personalizado pelo player (via Lua), no mesmo formato, ex.:
+//   https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api}
+const DEFAULT_LINK_TEMPLATE = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api}';
+const MAX_MODEL_LENGTH = 100;
+const MAX_LINK_LENGTH = 1000;
 
 // Limite de caracteres do prompt -- defesa em profundidade: o Lua ja limita
 // a mensagem do player (800 chars) antes de montar o prompt final, mas
@@ -24,6 +30,58 @@ const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models
 // Sem isso, um POST direto no /ai podia mandar um prompt gigante e gastar
 // tokens/custo no Gemini sem limite nenhum.
 const MAX_PROMPT_LENGTH = 15000;
+
+// Erro de entrada invalida (link/model personalizado) -- a rota /ai responde 400 em vez de 502.
+function invalidInput(message) {
+	const err = new Error(message);
+	err.statusCode = 400;
+	return err;
+}
+
+// Hosts que o proxy nunca deve acessar a pedido de um link personalizado (anti-SSRF):
+// localhost, dominios internos e qualquer IP literal (so aceita nome de dominio).
+function isBlockedHost(hostname) {
+	const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+	if (net.isIP(host)) return true;
+	if (host === 'localhost' || !host.includes('.')) return true;
+	return ['.localhost', '.local', '.internal', '.localdomain', '.lan', '.home.arpa'].some((suffix) => host.endsWith(suffix));
+}
+
+// Monta a URL final: troca {model} e {api} no template (usa split/join, entao '$' no valor
+// nunca vira padrao de replace) e valida o resultado.
+function buildRequestUrl(linkTemplate, model, apiKey) {
+	const template = linkTemplate || DEFAULT_LINK_TEMPLATE;
+	if (typeof template !== 'string' || template.length > MAX_LINK_LENGTH) {
+		throw invalidInput(`link must be a string of up to ${MAX_LINK_LENGTH} characters.`);
+	}
+	if (typeof model !== 'string' || model.length > MAX_MODEL_LENGTH || !/^[\w.:\-/]+$/.test(model)) {
+		throw invalidInput('model name is missing, too long or contains invalid characters.');
+	}
+
+	const finalUrl = template
+		.split('{model}').join(encodeURIComponent(model))
+		.split('{api}').join(encodeURIComponent(apiKey));
+
+	let parsed;
+	try {
+		parsed = new URL(finalUrl);
+	} catch (e) {
+		throw invalidInput('link is not a valid URL.');
+	}
+	if (parsed.protocol !== 'https:') {
+		throw invalidInput('link must use https.');
+	}
+	if (isBlockedHost(parsed.hostname)) {
+		throw invalidInput('link host is not allowed.');
+	}
+	return parsed.toString();
+}
+
+// A key vai dentro da URL; tira ela de qualquer mensagem de erro antes de sair do proxy.
+function redactSecret(text, secret) {
+	const value = String(text);
+	return secret ? value.split(secret).join('[redacted]').split(encodeURIComponent(secret)).join('[redacted]') : value;
+}
 
 // Personalidade/regras fixas do assistente dentro do Studio Mobi. Fica
 // separado do prompt que o Lua monta (que carrega o contexto especifico
@@ -249,7 +307,7 @@ async function askGemini(prompt, apiKey, options = {}) {
 	}
 
 	const model = options.model || DEFAULT_MODEL;
-	const url = `${GEMINI_BASE_URL}/${model}:generateContent?key=${apiKey}`;
+	const url = buildRequestUrl(options.link, model, apiKey.trim());
 
 	const body = {
 		contents: [
@@ -277,9 +335,10 @@ async function askGemini(prompt, apiKey, options = {}) {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(body),
+			redirect: 'error', // um link personalizado nao pode redirecionar o proxy pra outro host
 		});
 	} catch (e) {
-		throw new Error(`falha de rede ao contatar o Gemini: ${e.message}`);
+		throw new Error(`falha de rede ao contatar o Gemini: ${redactSecret(e.message, apiKey.trim())}`);
 	}
 
 	let data;
@@ -291,7 +350,7 @@ async function askGemini(prompt, apiKey, options = {}) {
 
 	if (!upstream.ok) {
 		const msg = (data && data.error && data.error.message) || `HTTP ${upstream.status}`;
-		throw new Error(`Gemini retornou erro: ${msg}`);
+		throw new Error(`Gemini retornou erro: ${redactSecret(msg, apiKey.trim())}`);
 	}
 
 	const candidate = data.candidates && data.candidates[0];
