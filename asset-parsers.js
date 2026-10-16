@@ -20,6 +20,13 @@ try {
 
 const SCRIPT_CLASS_NAMES = new Set(['Script', 'LocalScript', 'ModuleScript']);
 
+// Blobs binarios (dados de CSG das Unions, fisica, etc) que nenhum script consegue
+// escrever de volta -- descartados pra nao inflar o JSON com lixo.
+const SKIPPED_BLOB_PROPS = new Set([
+	'ChildData', 'ChildData2', 'MeshData', 'MeshData2', 'PhysicsData', 'LODData',
+	'AttributesSerialize', 'MaterialColors', 'SmoothGrid', 'PhysicsGrid',
+]);
+
 function decodeXMLEntities(s) {
 	return s
 		.replace(/&lt;/g, '<')
@@ -38,6 +45,13 @@ function rgbToHex(r, g, b) {
 	const clamp = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
 	const toHex = (v) => clamp(v).toString(16).padStart(2, '0');
 	return toHex(r) + toHex(g) + toHex(b);
+}
+
+// Color3uint8 / Color3 antigo: int empacotado 0xAARRGGBB -> "RRGGBB".
+function packedColorToHex(packed) {
+	const v = packed >>> 0;
+	const toHex = (c) => c.toString(16).padStart(2, '0');
+	return toHex((v >>> 16) & 255) + toHex((v >>> 8) & 255) + toHex(v & 255);
 }
 
 // =============================================================================
@@ -105,7 +119,7 @@ function parseXML(xml) {
 			if (!selfClosing) stack.push(node);
 		} else {
 			const next = xml.indexOf('<', i);
-			stack[stack.length - 1].text += xml.slice(i, next === -1 ? n : next);
+			stack[stack.length - 1].text += decodeXMLEntities(xml.slice(i, next === -1 ? n : next));
 			i = next === -1 ? n : next;
 		}
 	}
@@ -120,16 +134,16 @@ function xmlPropToValue(propNode) {
 	const tag = propNode.tag;
 	const getChildText = (name) => {
 		const c = propNode.children.find((c) => c.tag === name);
-		return c ? decodeXMLEntities(c.text) : null;
+		return c ? c.text : null;
 	};
 	const num = (s) => (s == null ? 0 : parseFloat(s)) || 0;
-	const text = () => decodeXMLEntities(propNode.text).trim();
+	const text = () => propNode.text.trim();
 
 	switch (tag) {
 		case 'bool':
 			return text() === 'true';
 		case 'string':
-			return decodeXMLEntities(propNode.text);
+			return propNode.text;
 		case 'int':
 		case 'int64':
 		case 'token':
@@ -152,7 +166,11 @@ function xmlPropToValue(propNode) {
 				],
 			};
 		case 'Color3':
+			// formato antigo: um unico int empacotado (0xAARRGGBB) em vez de <R><G><B>
+			if (getChildText('R') === null) return packedColorToHex(parseInt(text(), 10) || 0);
 			return rgbToHex(num(getChildText('R')), num(getChildText('G')), num(getChildText('B')));
+		case 'Color3uint8':
+			return packedColorToHex(parseInt(text(), 10) || 0);
 		case 'UDim':
 			return { scale: num(getChildText('S')), offset: num(getChildText('O')) };
 		case 'UDim2':
@@ -185,7 +203,7 @@ function xmlPropToValue(propNode) {
 				elasticityWeight: num(getChildText('ElasticityWeight')),
 			};
 		case 'Content':
-			return getChildText('url') || '';
+			return getChildText('url') || getChildText('uri') || '';
 		default:
 			return undefined; // tag desconhecida -- ignora essa property em vez de quebrar
 	}
@@ -211,10 +229,10 @@ function buildAssetTree(itemNode) {
 			if (!name) continue;
 
 			if (p.tag === 'Ref') {
-				const target = decodeXMLEntities(p.text).trim();
+				const target = p.text.trim();
 				if (target && target !== 'null') refs[name] = target;
 			} else if (p.tag === 'ProtectedString' && name === 'Source') {
-				source = decodeXMLEntities(p.text);
+				source = p.text;
 			} else {
 				const value = xmlPropToValue(p);
 				if (value !== undefined) properties[name] = value;
@@ -579,6 +597,7 @@ function extractAssetTreesFromBinary(buf) {
 				const classIndex = d.readUInt32LE(0);
 				const nameRes = readBinString(d, 4);
 				const propName = nameRes.value;
+				if (SKIPPED_BLOB_PROPS.has(propName)) continue;
 				const typeId = d.readUInt8(nameRes.next);
 				const valuesBuf = d.slice(nameRes.next + 1);
 				const info = classes[classIndex];
