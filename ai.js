@@ -162,6 +162,7 @@ Formato dos valores de propriedade no JSON:
 - BrickColor: o nome da cor como string, ex: "Bright red"
 - Enum (Material, PartType, etc): só o nome do item, ex: "SmoothPlastic", "Neon"
 - Instância (Class, ex: Parent): o caminho completo como string, ex: "game/Workspace/Baseplate".
+Escreva os comandos em texto puro: sem bloco de código, sem crases, sem marcadores de lista e sem numeração, cada comando começando no início da linha. JSON sempre com aspas duplas.
 Evite mandar muitos comandos para não furar o limite de 4096 tokens.
 `.trim();
 
@@ -240,7 +241,12 @@ function parseJsonArg(raw) {
 	try {
 		return JSON.parse(raw);
 	} catch (e) {
-		return null;
+		// Erros comuns de outros modelos: virgula sobrando antes de } ou ].
+		try {
+			return JSON.parse(raw.replace(/,\s*([}\]])/g, '$1'));
+		} catch (e2) {
+			return null;
+		}
 	}
 }
 
@@ -309,14 +315,28 @@ function parseCommandCall(callText) {
 	return null;
 }
 
+// Modelos que nao sao o Gemini costumam "enfeitar" a linha do comando: bloco de codigo (```),
+// crases, marcador de lista ("- ", "1. "). Tira esse enfeite antes de tentar interpretar a linha.
+const FENCE_LINE = /^\s*(```|~~~)[\w+-]*\s*$/;
+
+function normalizeCommandLine(line) {
+	return line
+		.trim()
+		.replace(/^(?:[-*•]|\d+[.)])\s+/, '')
+		.replace(/^`+|`+$/g, '')
+		.trim();
+}
+
 // Puxa o BLOCO de comandos do final da mensagem (um por linha, permitindo
-// linhas em branco entre eles/depois deles) e devolve { text, commands }.
+// linhas em branco entre eles/depois deles, e tambem comandos dentro de um bloco de codigo
+// que fecha a mensagem) e devolve { text, commands }.
 // text já sai limpo, sem nenhuma linha de comando -- é isso que o player
 // efetivamente vê na tela.
 function extractCommands(rawText) {
 	const lines = rawText.split('\n');
 	const commands = [];
 	let cut = lines.length;
+	let fenceCut = null; // indice do fence de fechamento, enquanto o de abertura nao foi achado
 
 	for (let i = lines.length - 1; i >= 0; i--) {
 		const line = lines[i].trim();
@@ -324,10 +344,28 @@ function extractCommands(rawText) {
 			cut = i;
 			continue;
 		}
-		const parsed = parseCommandCall(line);
+		if (FENCE_LINE.test(line)) {
+			if (fenceCut === null && commands.length === 0) {
+				fenceCut = i; // possivel fence de fechamento de um bloco so de comandos
+				cut = i;
+				continue;
+			}
+			if (fenceCut !== null) {
+				fenceCut = null; // fence de abertura: o bloco inteiro era de comandos
+				cut = i;
+				continue;
+			}
+			break;
+		}
+		const parsed = parseCommandCall(normalizeCommandLine(line));
 		if (!parsed) break;
 		commands.unshift(parsed);
 		cut = i;
+	}
+
+	// Fence de fechamento sem o de abertura: o bloco tinha texto junto, entao nao mexe em nada.
+	if (fenceCut !== null) {
+		return { text: rawText.trim(), commands: [] };
 	}
 
 	const text = lines.slice(0, cut).join('\n').trim();
@@ -421,7 +459,10 @@ async function askGemini(prompt, apiKey, options = {}) {
 		throw new Error(`o provedor retornou erro: ${redactSecret(msg, key)}`);
 	}
 
-	const { text: rawText, finishReason, blockReason } = parseProviderResponse(provider, data);
+	const parsedResponse = parseProviderResponse(provider, data);
+	const { finishReason, blockReason } = parsedResponse;
+	// Alguns modelos (DeepSeek, Qwen, varios gratuitos do OpenRouter) mandam o raciocinio em <think>...</think>.
+	const rawText = parsedResponse.text.replace(/<(think|thinking|reasoning)>[\s\S]*?<\/\1>/gi, '').trim();
 
 	// Bloqueio de safety filter (do prompt inteiro) chega sem candidato
 	if (blockReason) {
