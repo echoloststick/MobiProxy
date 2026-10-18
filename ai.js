@@ -1,25 +1,25 @@
-// SMFX AI Assistant -- ponte com a API do Gemini
+// SMFX AI Assistant -- ponte com APIs de IA (Gemini e APIs compativeis com OpenAI, como Groq)
 // Arquivo separado do main.js de proposito (esse ja esta enorme). Exporta
-// uma unica funcao, askGemini(prompt, apiKey, options), usada pela rota
+// askGemini(prompt, apiKey, options) (nome mantido por compatibilidade), usada pela rota
 // POST /ai no main.js.
 //
-// A API KEY DO GEMINI VEM DO LUA (script do lado do SERVIDOR do jogo, que
+// A API KEY VEM DO LUA (script do lado do SERVIDOR do jogo, que
 // ninguem alem do dono consegue abrir/copiar -- diferente de LocalScript,
 // que qualquer um exploraria facil). O proxy NAO guarda a key em lugar
-// nenhum (nem env var): so repassa pro Gemini o que chegou no header
-// x-api-key da requisicao e esquece. Isso evita depender de configurar
-// env var no Render toda vez que a key mudar, e evita ter uma key "fixa"
-// do proxy que serviria pra qualquer jogo que apontar pra ele.
+// nenhum (nem env var): so repassa pro provedor o que chegou no header
+// x-api-key da requisicao e esquece.
 
 // Modelo atualizado em set/2026: o Gemini aposentou o gemini-2.0-flash e
 // recomendou este no proprio erro da API. Gemini 3.x tambem ignora valores
-// customizados de temperature/top-K/top-P (nao da erro, so ignora), entao
-// o generationConfig abaixo continua inofensivo mesmo que isso mude de novo.
+// customizados de temperature/top-K/top-P (nao da erro, so ignora).
 const DEFAULT_MODEL = 'gemini-3.6-flash';
 const net = require('net');
 // Template do link padrao. {model} e {api} sao trocados em buildRequestUrl().
-// O link tambem pode vir personalizado pelo player (via Lua), no mesmo formato, ex.:
-//   https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api}
+// O link tambem pode vir personalizado pelo player (via Lua). Dois formatos:
+//   Gemini:  https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api}
+//   Anthropic: https://api.anthropic.com/v1/messages (key no header x-api-key)
+//   OpenAI-compativel (Groq etc., sem {model}/{api}):  https://api.groq.com/openai/v1/chat/completions
+//     -> o modelo vai no body e a key vai no header "Authorization: Bearer <key>".
 const DEFAULT_LINK_TEMPLATE = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api}';
 const MAX_MODEL_LENGTH = 100;
 const MAX_LINK_LENGTH = 1000;
@@ -27,8 +27,6 @@ const MAX_LINK_LENGTH = 1000;
 // Limite de caracteres do prompt -- defesa em profundidade: o Lua ja limita
 // a mensagem do player (800 chars) antes de montar o prompt final, mas
 // quem chamar o proxy direto (sem passar pelo jogo) nao tem essa trava.
-// Sem isso, um POST direto no /ai podia mandar um prompt gigante e gastar
-// tokens/custo no Gemini sem limite nenhum.
 const MAX_PROMPT_LENGTH = 15000;
 
 // Erro de entrada invalida (link/model personalizado) -- a rota /ai responde 400 em vez de 502.
@@ -77,10 +75,55 @@ function buildRequestUrl(linkTemplate, model, apiKey) {
 	return parsed.toString();
 }
 
-// A key vai dentro da URL; tira ela de qualquer mensagem de erro antes de sair do proxy.
+// A key pode ir dentro da URL; tira ela de qualquer mensagem de erro antes de sair do proxy.
 function redactSecret(text, secret) {
 	const value = String(text);
 	return secret ? value.split(secret).join('[redacted]').split(encodeURIComponent(secret)).join('[redacted]') : value;
+}
+
+// Provedores suportados:
+//   gemini: URL com :generateContent (key normalmente em {api} na propria URL).
+//   openai: qualquer API compativel com OpenAI (Groq, OpenAI, OpenRouter, Together, Mistral, DeepSeek...).
+//   anthropic: api.anthropic.com/v1/messages (header x-api-key + anthropic-version, system separado, max_tokens obrigatorio).
+function detectProvider(url) {
+	if (/^https:\/\/api\.anthropic\.com\//i.test(url)) return 'anthropic';
+	return /generativelanguage\.googleapis\.com|:generateContent|:streamGenerateContent/i.test(url) ? 'gemini' : 'openai';
+}
+
+// Pega o texto da resposta nos dois formatos. Devolve { text, finishReason, blockReason }.
+function parseProviderResponse(provider, data) {
+	if (provider === 'anthropic') {
+		const parts = data && Array.isArray(data.content) ? data.content : [];
+		const text = parts.filter((p) => p && p.type === 'text').map((p) => p.text || '').join('');
+		const reason = data && data.stop_reason;
+		return {
+			text,
+			finishReason: reason === 'max_tokens' ? 'MAX_TOKENS' : reason === 'refusal' ? 'SAFETY' : reason || null,
+			blockReason: null,
+		};
+	}
+
+	if (provider === 'openai') {
+		const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
+		const message = choice && choice.message;
+		let text = '';
+		if (message && typeof message.content === 'string') {
+			text = message.content;
+		} else if (message && Array.isArray(message.content)) {
+			text = message.content.map((p) => (p && p.text) || '').join('');
+		}
+		const reason = choice && choice.finish_reason;
+		// OpenAI usa "length" pra limite de tokens; normaliza pro valor que o resto do codigo ja entende.
+		return { text, finishReason: reason === 'length' ? 'MAX_TOKENS' : reason || null, blockReason: null };
+	}
+
+	const candidate = data.candidates && data.candidates[0];
+	const finishReason = (candidate && candidate.finishReason) || null;
+	const blockReason = !candidate && data.promptFeedback && data.promptFeedback.blockReason;
+	const text = candidate && candidate.content && Array.isArray(candidate.content.parts)
+		? candidate.content.parts.map((p) => p.text || '').join('')
+		: '';
+	return { text, finishReason, blockReason: blockReason || null };
 }
 
 // Personalidade/regras fixas do assistente dentro do Studio Mobi. Fica
@@ -291,13 +334,13 @@ function extractCommands(rawText) {
 	return { text, commands };
 }
 
-// Chama o Gemini com um prompt ja pronto (o Lua/servidor decide o que vai
-// no prompt) e a API key que o proprio Lua mandou. Retorna { text,
+// Chama a IA com um prompt ja pronto (o Lua/servidor decide o que vai
+// no prompt) e a API key que o proprio Lua mandou. Retorna { text, commands,
 // finishReason }. Lanca Error em qualquer falha -- quem chama (a rota /ai)
 // decide como isso vira JSON de erro.
 async function askGemini(prompt, apiKey, options = {}) {
 	if (typeof apiKey !== 'string' || apiKey.trim() === '') {
-		throw new Error("API key do Gemini nao foi enviada (header 'x-api-key').");
+		throw new Error("API key nao foi enviada (header 'x-api-key').");
 	}
 	if (typeof prompt !== 'string' || prompt.trim() === '') {
 		throw new Error("campo 'prompt' vazio ou invalido.");
@@ -306,71 +349,89 @@ async function askGemini(prompt, apiKey, options = {}) {
 		throw new Error(`prompt excede o limite de ${MAX_PROMPT_LENGTH} caracteres.`);
 	}
 
-	const model = options.model || DEFAULT_MODEL;
-	const url = buildRequestUrl(options.link, model, apiKey.trim());
+	const template = typeof options.link === 'string' && options.link !== '' ? options.link : DEFAULT_LINK_TEMPLATE;
+	const provider = detectProvider(template);
+	// Em APIs OpenAI-compativeis e na Anthropic o modelo vai no body, entao nao existe um padrao que sirva.
+	if (provider !== 'gemini' && !options.model) {
+		throw invalidInput('this endpoint needs a model name (it is sent in the request body).');
+	}
 
-	const body = {
-		contents: [
-			{
-				role: 'user',
-				parts: [{ text: prompt }],
-			},
-		],
-		generationConfig: {
-			temperature: typeof options.temperature === 'number' ? options.temperature : 0.7,
-			// 1024 cortava respostas com script no meio (finishReason
-			// MAX_TOKENS) -- scripts completos e prontos pra usar (que é
-			// bem o que o assistente promete) precisam de bem mais espaço.
-			maxOutputTokens: typeof options.maxOutputTokens === 'number' ? options.maxOutputTokens : 7500,
-		},
-		systemInstruction: {
-			role: 'system',
-			parts: [{ text: buildSystemInstruction(options.systemInstruction, options.selection) }],
-		},
-	};
+	const model = options.model || DEFAULT_MODEL;
+	const key = apiKey.trim();
+	const url = buildRequestUrl(template, model, key);
+	const systemText = buildSystemInstruction(options.systemInstruction, options.selection);
+	const temperature = typeof options.temperature === 'number' ? options.temperature : 0.7;
+	// 1024 cortava respostas com script no meio (MAX_TOKENS) -- scripts
+	// completos e prontos pra usar precisam de bem mais espaço.
+	const maxTokens = typeof options.maxOutputTokens === 'number' ? options.maxOutputTokens : 7500;
+
+	const headers = { 'Content-Type': 'application/json' };
+	let body;
+	if (provider === 'anthropic') {
+		headers['x-api-key'] = key;
+		headers['anthropic-version'] = '2023-06-01';
+		body = {
+			model,
+			max_tokens: maxTokens,
+			temperature,
+			system: systemText,
+			messages: [{ role: 'user', content: prompt }],
+		};
+	} else if (provider === 'openai') {
+		headers.Authorization = `Bearer ${key}`;
+		body = {
+			model,
+			messages: [
+				{ role: 'system', content: systemText },
+				{ role: 'user', content: prompt },
+			],
+			temperature,
+			max_tokens: maxTokens,
+		};
+	} else {
+		body = {
+			contents: [{ role: 'user', parts: [{ text: prompt }] }],
+			generationConfig: { temperature, maxOutputTokens: maxTokens },
+			systemInstruction: { role: 'system', parts: [{ text: systemText }] },
+		};
+	}
 
 	let upstream;
 	try {
 		upstream = await fetch(url, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers,
 			body: JSON.stringify(body),
 			redirect: 'error', // um link personalizado nao pode redirecionar o proxy pra outro host
 		});
 	} catch (e) {
-		throw new Error(`falha de rede ao contatar o Gemini: ${redactSecret(e.message, apiKey.trim())}`);
+		throw new Error(`falha de rede ao contatar o provedor de IA: ${redactSecret(e.message, key)}`);
 	}
 
 	let data;
 	try {
 		data = await upstream.json();
 	} catch (e) {
-		throw new Error(`resposta do Gemini nao veio em JSON valido (status ${upstream.status}).`);
+		throw new Error(`resposta do provedor nao veio em JSON valido (status ${upstream.status}).`);
 	}
 
 	if (!upstream.ok) {
-		const msg = (data && data.error && data.error.message) || `HTTP ${upstream.status}`;
-		throw new Error(`Gemini retornou erro: ${redactSecret(msg, apiKey.trim())}`);
+		// Gemini e OpenAI/Groq usam o mesmo formato { error: { message } }.
+		const msg = (data && data.error && (data.error.message || (typeof data.error === 'string' && data.error))) || `HTTP ${upstream.status}`;
+		throw new Error(`o provedor retornou erro: ${redactSecret(msg, key)}`);
 	}
 
-	const candidate = data.candidates && data.candidates[0];
-	const finishReason = (candidate && candidate.finishReason) || null;
+	const { text: rawText, finishReason, blockReason } = parseProviderResponse(provider, data);
 
-	// Bloqueio de safety filter (do prompt inteiro) chega aqui, nao em candidates
-	if (!candidate && data.promptFeedback && data.promptFeedback.blockReason) {
-		throw new Error(`prompt bloqueado pelo Gemini (motivo: ${data.promptFeedback.blockReason}).`);
+	// Bloqueio de safety filter (do prompt inteiro) chega sem candidato
+	if (blockReason) {
+		throw new Error(`prompt bloqueado pelo provedor (motivo: ${blockReason}).`);
 	}
-
-	if (!candidate || !candidate.content || !Array.isArray(candidate.content.parts)) {
-		if (finishReason === 'SAFETY') {
-			throw new Error('resposta bloqueada pelo filtro de seguranca do Gemini.');
-		}
-		throw new Error('Gemini nao retornou nenhum conteudo utilizavel.');
-	}
-
-	const rawText = candidate.content.parts.map((p) => p.text || '').join('');
 	if (!rawText) {
-		throw new Error('Gemini retornou uma resposta vazia.');
+		if (finishReason === 'SAFETY' || finishReason === 'content_filter') {
+			throw new Error('resposta bloqueada pelo filtro de seguranca do provedor.');
+		}
+		throw new Error('o provedor nao retornou nenhum conteudo utilizavel.');
 	}
 
 	// Tira os comandos (create/edit/delete/editsource) do final da mensagem
@@ -378,11 +439,9 @@ async function askGemini(prompt, apiKey, options = {}) {
 	const { text: cleanedText, commands } = extractCommands(rawText);
 	let finalText = cleanedText || 'Feito!'; // se a mensagem era só comando, não pode voltar vazio
 
-	// MAX_TOKENS não é erro (o Gemini devolve o texto que já tinha gerado
+	// MAX_TOKENS não é erro (o provedor devolve o texto que já tinha gerado
 	// até estourar o limite), mas fica parecendo bug se o player receber
-	// um script cortado no meio sem nenhum aviso -- foi exatamente isso
-	// que aconteceu com maxOutputTokens em 1024. Marca visivelmente em vez
-	// de deixar passar batido.
+	// um script cortado no meio sem nenhum aviso. Marca visivelmente.
 	if (finishReason === 'MAX_TOKENS') {
 		finalText += '\n\n → Response cut off due to token limit.';
 	}
