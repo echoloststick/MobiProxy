@@ -18,7 +18,11 @@ const HASH_BITS = 16;
 function lz4Compress(src) {
 	const n = src.length;
 	if (n < 13) return null;
-	const out = [];
+	// Worst-case LZ4 block size is n + n/255 + 16, so one preallocated buffer is always enough.
+	// (The previous version pushed every byte into a JS array, which is very slow and memory
+	// hungry for large places.)
+	const out = Buffer.allocUnsafe(n + Math.floor(n / 255) + 16);
+	let op = 0;
 	const table = new Int32Array(1 << HASH_BITS).fill(-1);
 	const matchLimit = n - 12; // a match must start before this position
 	let anchor = 0;
@@ -26,10 +30,10 @@ function lz4Compress(src) {
 
 	const pushLength = (len) => {
 		while (len >= 255) {
-			out.push(255);
+			out[op++] = 255;
 			len -= 255;
 		}
-		out.push(len);
+		out[op++] = len;
 	};
 
 	while (i < matchLimit) {
@@ -48,11 +52,13 @@ function lz4Compress(src) {
 
 			const literals = i - anchor;
 			const matchCode = len - MIN_MATCH;
-			out.push(((literals >= 15 ? 15 : literals) << 4) | (matchCode >= 15 ? 15 : matchCode));
+			out[op++] = ((literals >= 15 ? 15 : literals) << 4) | (matchCode >= 15 ? 15 : matchCode);
 			if (literals >= 15) pushLength(literals - 15);
-			for (let k = anchor; k < i; k++) out.push(src[k]);
+			src.copy(out, op, anchor, i);
+			op += literals;
 			const offset = i - ref;
-			out.push(offset & 255, offset >> 8);
+			out[op++] = offset & 255;
+			out[op++] = offset >> 8;
 			if (matchCode >= 15) pushLength(matchCode - 15);
 
 			i += len;
@@ -63,10 +69,11 @@ function lz4Compress(src) {
 	}
 
 	const literals = n - anchor;
-	out.push((literals >= 15 ? 15 : literals) << 4);
+	out[op++] = (literals >= 15 ? 15 : literals) << 4;
 	if (literals >= 15) pushLength(literals - 15);
-	for (let k = anchor; k < n; k++) out.push(src[k]);
-	return Buffer.from(out);
+	src.copy(out, op, anchor, n);
+	op += literals;
+	return Buffer.from(out.subarray(0, op));
 }
 
 function lz4Decompress(src, size) {
@@ -251,10 +258,13 @@ const ENCODERS = {
 	},
 	PhysicalProperties: {
 		type: T.PhysicalProperties,
-		// Flag 1 = custom values, followed by six floats (the last is AcousticAbsorption = 1).
+		// Flags byte: bit 0 = custom values (followed by exactly five floats), bit 1 = an extra
+		// AcousticAbsorption float follows. The old code set only bit 0 but wrote a sixth float, so
+		// the reader consumed that float as the next instance's flags byte and the whole PROP chunk
+		// (and every property after it) was misaligned. Only bit 0 is set here, with five floats.
 		encode: (vs) => Buffer.concat(vs.map((v) => (v == null
 			? Buffer.from([0])
-			: Buffer.concat([Buffer.from([1]), f32(v.density), f32(v.friction), f32(v.elasticity), f32(v.frictionWeight), f32(v.elasticityWeight), f32(1)])))),
+			: Buffer.concat([Buffer.from([1]), f32(v.density), f32(v.friction), f32(v.elasticity), f32(v.frictionWeight), f32(v.elasticityWeight)])))),
 	},
 };
 const VALIDATORS = {
@@ -458,7 +468,11 @@ function buildRBXL(objects, defaultsByClass) {
 		chunks.push(chunk('PROP', Buffer.concat([u32(classId), str('Name'), Buffer.from([T.String]), ENCODERS.string.encode(names)])));
 
 		if (SCRIPT_CLASSES.has(className)) {
-			const sources = instances.map((n) => (typeof n.source === 'string' ? n.source : ''));
+			const sources = instances.map((n) => {
+				if (typeof n.source === 'string') return n.source;
+				const prop = n.properties.Source;
+				return prop && typeof prop.value === 'string' ? prop.value : '';
+			});
 			chunks.push(chunk('PROP', Buffer.concat([u32(classId), str('Source'), Buffer.from([T.String]), ENCODERS.string.encode(sources)])));
 		}
 

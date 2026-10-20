@@ -7,15 +7,61 @@
 
 const zlib = require('zlib');
 
-// Usado so pra descomprimir os chunks do formato binario .rbxm (LZ4 raw block,
-// sem frame header). Precisa rodar `npm install lz4` no proxy. Se nao tiver
-// instalado, o parser binario so retorna vazio (fallback seguro, nao derruba
-// a rota) -- o parser de XML (.rbxmx) continua funcionando normal.
-let lz4;
-try {
-	lz4 = require('lz4');
-} catch (e) {
-	lz4 = null;
+// Descompressor LZ4 (raw block, sem frame header) proprio, sem dependencia externa.
+// Antes o parser dependia do pacote npm `lz4`; se ele nao estivesse instalado no
+// proxy (ou se decodeBlock falhasse), o chunk virava um Buffer VAZIO em silencio.
+// Modelos pequenos nao sao comprimidos (compressedLength = 0), entao funcionavam;
+// modelos grandes tem os chunks INST/PROP/PRNT comprimidos e chegavam no jogo sem
+// nenhuma instancia. Agora a falha de descompressao e detectada e reportada.
+function lz4DecodeBlock(src, size) {
+	const out = Buffer.alloc(size);
+	let s = 0;
+	let d = 0;
+	const n = src.length;
+	while (s < n) {
+		const token = src[s++];
+		let literals = token >> 4;
+		if (literals === 15) {
+			let b;
+			do {
+				if (s >= n) return null;
+				b = src[s++];
+				literals += b;
+			} while (b === 255);
+		}
+		if (s + literals > n || d + literals > size) return null;
+		src.copy(out, d, s, s + literals);
+		s += literals;
+		d += literals;
+		if (s >= n) break; // last sequence only has literals
+		if (s + 2 > n) return null;
+		const offset = src[s] | (src[s + 1] << 8);
+		s += 2;
+		if (offset === 0 || offset > d) return null;
+		let matchLen = token & 15;
+		if (matchLen === 15) {
+			let b;
+			do {
+				if (s >= n) return null;
+				b = src[s++];
+				matchLen += b;
+			} while (b === 255);
+		}
+		matchLen += 4;
+		if (d + matchLen > size) return null;
+		for (let k = 0; k < matchLen; k++) {
+			out[d] = out[d - offset];
+			d++;
+		}
+	}
+	return d === size ? out : null;
+}
+
+// Problemas encontrados no ultimo parse binario (descompressao falhou, tipo de
+// chunk sem suporte, etc). Fica no console porque o shape de saida do parser
+// ({ referent, className, ... }) nao pode mudar para o ToolboxHandler.lua.
+function warnParse(message) {
+	console.warn('[asset-parsers] ' + message);
 }
 
 const SCRIPT_CLASS_NAMES = new Set(['Script', 'LocalScript', 'ModuleScript']);
@@ -108,8 +154,9 @@ function parseXML(xml) {
 			const attrs = {};
 			if (spaceIdx !== -1) {
 				const attrRe = /([\w:.-]+)\s*=\s*(['"])(.*?)\2/g;
+				const attrText = body.slice(spaceIdx);
 				let am;
-				while ((am = attrRe.exec(body.slice(spaceIdx))) !== null) {
+				while ((am = attrRe.exec(attrText)) !== null) {
 					attrs[am[1]] = decodeXMLEntities(am[3]);
 				}
 			}
@@ -321,13 +368,11 @@ function decompressChunk(compressed, uncompressedLength) {
 		if (typeof zlib.zstdDecompressSync === 'function') {
 			try { return zlib.zstdDecompressSync(compressed); } catch (e) { return null; }
 		}
-		return null; // ZSTD -- precisa de Node novo o suficiente pra zlib.zstdDecompressSync
+		warnParse('chunk uses ZSTD but this Node version has no zlib.zstdDecompressSync (needs Node 22.15+ / 23.8+).');
+		return null;
 	}
-	if (!lz4) return null;
-	const out = Buffer.alloc(uncompressedLength);
 	try {
-		lz4.decodeBlock(compressed, out);
-		return out;
+		return lz4DecodeBlock(compressed, uncompressedLength);
 	} catch (e) {
 		return null;
 	}
@@ -349,7 +394,11 @@ function readBinaryChunks(buf) {
 			offset = dataStart + uncompressedLength;
 		} else {
 			const compressed = buf.slice(dataStart, dataStart + compressedLength);
-			data = decompressChunk(compressed, uncompressedLength) || Buffer.alloc(0);
+			data = decompressChunk(compressed, uncompressedLength);
+			if (!data) {
+				warnParse(`failed to decompress chunk ${name} (${compressedLength} -> ${uncompressedLength} bytes); chunk skipped.`);
+				data = Buffer.alloc(0);
+			}
 			offset = dataStart + compressedLength;
 		}
 
@@ -627,6 +676,7 @@ function extractAssetTreesFromBinary(buf) {
 				prntParent = readReferentArray(d, off, instanceCount);
 			}
 		} catch (e) {
+			warnParse(`chunk ${chunk.name} has an unexpected layout (${e.message}); chunk skipped.`);
 			continue; // chunk com layout inesperado -- pula, nao aborta o resto
 		}
 	}
@@ -640,19 +690,36 @@ function extractAssetTreesFromBinary(buf) {
 	}
 
 	const roots = [];
-	if (prntChild && prntParent) {
-		for (let i = 0; i < prntChild.length; i++) {
-			const childNode = nodesByReferent.get(prntChild[i]);
-			if (!childNode) continue;
-			const parentRef = prntParent[i];
-			if (parentRef === -1) {
-				roots.push(childNode);
-			} else {
-				const parentNode = nodesByReferent.get(parentRef);
-				if (parentNode) parentNode.children.push(childNode);
-				else roots.push(childNode); // pai fora do arquivo -- trata como raiz
-			}
-		}
+	if (!prntChild || !prntParent) {
+		warnParse(`no usable PRNT chunk (parent table); ${nodesByReferent.size} instances found but no hierarchy could be built.`);
+		return roots;
+	}
+
+	// Each instance gets exactly one parent. A node is attached once only, so a repeated or
+	// self-referencing PRNT entry can never create a cycle in the tree handed to the game.
+	const attached = new Set();
+	for (let i = 0; i < prntChild.length; i++) {
+		const childNode = nodesByReferent.get(prntChild[i]);
+		if (!childNode || attached.has(childNode)) continue;
+		attached.add(childNode);
+		const parentRef = prntParent[i];
+		const parentNode = parentRef === -1 ? null : nodesByReferent.get(parentRef);
+		if (parentNode && parentNode !== childNode) parentNode.children.push(childNode);
+		else roots.push(childNode); // sem pai (-1) ou pai fora do arquivo -- trata como raiz
+	}
+
+	// Anything that is not reachable from a root (cyclic parent chain) would be dropped silently;
+	// report it so a half-loaded model can be diagnosed.
+	const reachable = new Set();
+	const stack = roots.slice();
+	while (stack.length > 0) {
+		const node = stack.pop();
+		if (reachable.has(node)) continue;
+		reachable.add(node);
+		for (const child of node.children) stack.push(child);
+	}
+	if (reachable.size < nodesByReferent.size) {
+		warnParse(`${nodesByReferent.size - reachable.size} of ${nodesByReferent.size} instances are not reachable from any root (missing or cyclic parent entries).`);
 	}
 
 	return roots;

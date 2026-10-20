@@ -10,7 +10,7 @@
 
 const XML_ESCAPE = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
 
-const ILLEGAL_XML_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+const ILLEGAL_XML_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
 function esc(s) {
 	return String(s)
@@ -18,12 +18,59 @@ function esc(s) {
 		.replace(/[&<>'"]/g, (c) => XML_ESCAPE[c]);
 }
 
-const INVALID_VALUE_TEXT = /undefined|null|NaN|Infinity/;
-const TEXT_KINDS = new Set(['string', 'Content']);
+// Script source goes inside CDATA, the same way Studio writes it. This keeps the text byte-for-byte
+// (including \r, quotes and long runs of entities) and avoids any parser differences on entity
+// decoding. The only sequence that cannot appear inside CDATA is "]]>", so it is split in two.
+function cdata(s) {
+	const clean = String(s).replace(ILLEGAL_XML_CHARS, '');
+	return '<![CDATA[' + clean.split(']]>').join(']]]]><![CDATA[>') + ']]>';
+}
 
-function isValidPropertyXML(kind, xml) {
-	if (TEXT_KINDS.has(kind)) return !/>undefined<|>null<|>NaN</.test(xml);
-	return !INVALID_VALUE_TEXT.test(xml.replace(/ name='[^']*'/, ''));
+const SCRIPT_CLASSES = new Set(['Script', 'LocalScript', 'ModuleScript']);
+const isFiniteNumber = (v) => typeof v === 'number' && Number.isFinite(v);
+
+// Validates the VALUE (not the generated text), so a legitimate string such as an object named
+// "null" or "undefined" is no longer discarded.
+function isValidValue(kind, value) {
+	switch (kind) {
+		case 'string':
+			return typeof value === 'string';
+		case 'Content':
+			return value == null || typeof value === 'string';
+		case 'bool':
+			return typeof value === 'boolean';
+		case 'int':
+		case 'int64':
+		case 'float':
+		case 'double':
+		case 'token':
+			return isFiniteNumber(value);
+		case 'BrickColor':
+			return !!value && isFiniteNumber(value.number);
+		case 'Vector2':
+			return !!value && isFiniteNumber(value.x) && isFiniteNumber(value.y);
+		case 'Vector3':
+			return !!value && isFiniteNumber(value.x) && isFiniteNumber(value.y) && isFiniteNumber(value.z);
+		case 'CFrame':
+			return !!value && Array.isArray(value.c) && value.c.length >= 12 && value.c.slice(0, 12).every(isFiniteNumber);
+		case 'Color3':
+			return !!value && isFiniteNumber(value.r) && isFiniteNumber(value.g) && isFiniteNumber(value.b);
+		case 'UDim':
+			return !!value && isFiniteNumber(value.scale) && isFiniteNumber(value.offset);
+		case 'UDim2':
+			return !!value && !!value.x && !!value.y && isFiniteNumber(value.x.scale) && isFiniteNumber(value.x.offset) &&
+				isFiniteNumber(value.y.scale) && isFiniteNumber(value.y.offset);
+		case 'NumberRange':
+			return !!value && isFiniteNumber(value.min) && isFiniteNumber(value.max);
+		case 'NumberSequence':
+			return !!value && Array.isArray(value.keypoints) && value.keypoints.every((k) => k && isFiniteNumber(k.t) && isFiniteNumber(k.v) && isFiniteNumber(k.e));
+		case 'ColorSequence':
+			return !!value && Array.isArray(value.keypoints) && value.keypoints.every((k) => k && isFiniteNumber(k.t) && isFiniteNumber(k.r) && isFiniteNumber(k.g) && isFiniteNumber(k.b));
+		case 'PhysicalProperties':
+			return value == null || (typeof value === 'object' && isFiniteNumber(value.density));
+		default:
+			return false;
+	}
 }
 
 // Propriedades de runtime/somente leitura que o Studio nunca grava no arquivo. Escrever isso no
@@ -105,6 +152,9 @@ function propertyXML(propName, kind, value) {
 		case 'BrickColor':
 			return `<int name='${n}'>${Math.trunc(value.number)}</int>`;
 		case 'PhysicalProperties':
+			if (value == null) {
+				return `<PhysicalProperties name='${n}'><CustomPhysics>false</CustomPhysics></PhysicalProperties>`;
+			}
 			return (
 				`<PhysicalProperties name='${n}'><CustomPhysics>true</CustomPhysics>` +
 				`<Density>${value.density}</Density><Friction>${value.friction}</Friction>` +
@@ -215,6 +265,9 @@ function emitNode(node, out, nodes) {
 		if (isTerrain && propName === 'Decoration') continue;
 		if (!prop || typeof prop !== 'object') continue;
 		if (NOT_SERIALIZED.has(propName)) continue;
+		// Script source is written once, below, as a ProtectedString. If the Lua side also listed
+		// "Source" as a regular property, writing it here would produce a duplicate <string> entry.
+		if (propName === 'Source' && SCRIPT_CLASSES.has(node.className)) continue;
 		const { kind, value } = prop;
 
 		if (kind === 'ref') {
@@ -227,8 +280,10 @@ function emitNode(node, out, nodes) {
 		} else {
 			try {
 				const fileName = (FILE_NAME[node.className] && FILE_NAME[node.className][propName]) || propName;
-				const xml = propertyXML(fileName, kind, value);
-				if (xml && isValidPropertyXML(kind, xml)) out.push(xml);
+				if (isValidValue(kind, value)) {
+					const xml = propertyXML(fileName, kind, value);
+					if (xml) out.push(xml);
+				}
 			} catch (e) {
 				// valor invalido -- pula so essa property
 			}
@@ -255,8 +310,11 @@ function emitNode(node, out, nodes) {
 		out.push("<bool name='Decoration'>true</bool>");
 	}
 
-	if (node.source) {
-		out.push(`<ProtectedString name='Source'>${esc(node.source)}</ProtectedString>`);
+	if (SCRIPT_CLASSES.has(node.className)) {
+		// Scripts always get a Source tag (empty when there is no code), like Studio does.
+		const fromProp = node.properties.Source && typeof node.properties.Source.value === 'string' ? node.properties.Source.value : '';
+		const source = typeof node.source === 'string' ? node.source : fromProp;
+		out.push(`<ProtectedString name='Source'>${cdata(source)}</ProtectedString>`);
 	}
 
 	out.push('</Properties>');
