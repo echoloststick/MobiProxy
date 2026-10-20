@@ -68,6 +68,11 @@
 //   POST /decompress -> faz o caminho inverso: recebe o base64url e devolve os bytes originais.
 //                     Usadas pelo SMFXSaveCodec pra guardar o JSON dos projetos comprimido no
 //                     DataStore (o Lua manda em pedacos de ~900 KB). Logica isolada em compress.js.
+//   POST /translate  -> recebe { texts: [..], target, source? } e devolve { ok, translations: [..] } na
+//                     mesma ordem ("" quando um item nao pode ser traduzido). Usada pelo TranslateServer
+//                     (Script do servidor do jogo) pra traduzir a interface do Studio Mobi. Protege tags
+//                     RichText, tem cache em memoria e usa GOOGLE_TRANSLATE_API_KEY se existir (senao o
+//                     endpoint web gratuito). Logica isolada em translate.js.
 
 const express = require('express');
 const zlib = require('zlib');
@@ -486,6 +491,7 @@ app.get('/asset', async (req, res) => {
 });
 
 require('./compress').register(app, express);
+require('./translate').register(app, express);
 
 // MOBI -> Luau. O register() monta um Router proprio em /mobi (com o seu proprio parser JSON) e nao
 // mexe em nenhuma rota acima. Se a pasta Mobi/ estiver ausente ou quebrada, o proxy sobe do mesmo
