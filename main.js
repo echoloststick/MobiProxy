@@ -73,6 +73,10 @@
 //                     (Script do servidor do jogo) pra traduzir a interface do Studio Mobi. Protege tags
 //                     RichText, tem cache em memoria e usa GOOGLE_TRANSLATE_API_KEY se existir (senao o
 //                     endpoint web gratuito). Logica isolada em translate.js.
+//   GET  /rig/catalog -> busca acessorios no catalogo (catalog.roblox.com) por categoria do Avatar
+//                     Editor (Head, Hair, Face, Neck, Shoulder, Front, Back, Waist), com keyword e
+//                     cursor de paginacao. Devolve { ok, items: [{ id, name, price }], next }.
+//                     Logica isolada em rig-catalog.js.
 
 const express = require('express');
 const zlib = require('zlib');
@@ -492,6 +496,7 @@ app.get('/asset', async (req, res) => {
 
 require('./compress').register(app, express);
 require('./translate').register(app, express);
+require('./rig-catalog').register(app);
 
 // MOBI -> Luau. O register() monta um Router proprio em /mobi (com o seu proprio parser JSON) e nao
 // mexe em nenhuma rota acima. Se a pasta Mobi/ estiver ausente ou quebrada, o proxy sobe do mesmo
