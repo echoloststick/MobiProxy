@@ -5,9 +5,11 @@ const MAX_TEXT_LENGTH = 1000;
 const MAX_TOTAL_LENGTH = 12000;
 const CACHE_LIMIT = 30000;
 const CONCURRENCY = 6;
-const REQUEST_TIMEOUT_MS = 8000;
-const OFFICIAL_BATCH_SIZE = 100;
 const DEFAULT_SOURCE = 'en';
+
+const ENGINE = (process.env.TRANSLATE_ENGINE || 'google').toLowerCase();
+const ENGINE_KEY = process.env.TRANSLATE_KEY || undefined;
+const ENGINE_URL = process.env.TRANSLATE_URL || undefined;
 
 const PROTECTED_PATTERN = /(<[^>]*>|&[a-zA-Z]+;|&#\d+;)/;
 const HAS_LETTER = /\p{L}/u;
@@ -22,15 +24,23 @@ const LANGUAGE_ALIASES = {
 };
 
 const cache = new Map();
+let translatorPromise = null;
 
-function normalizeLanguage(code, allowAuto) {
+function loadTranslator() {
+	if (!translatorPromise) {
+		translatorPromise = import('translate').then((module) => module.default || module);
+		translatorPromise.catch(() => {
+			translatorPromise = null;
+		});
+	}
+	return translatorPromise;
+}
+
+function normalizeLanguage(code) {
 	if (typeof code !== 'string') {
 		return null;
 	}
 	const lower = code.trim().toLowerCase().replace(/_/g, '-');
-	if (allowAuto && lower === 'auto') {
-		return 'auto';
-	}
 	if (!LANGUAGE_PATTERN.test(lower)) {
 		return null;
 	}
@@ -73,72 +83,33 @@ async function runPool(items, worker, limit) {
 	return results;
 }
 
-async function translateViaWeb(text, source, target) {
-	const url =
-		'https://translate.googleapis.com/translate_a/single?client=gtx' +
-		`&sl=${encodeURIComponent(source)}&tl=${encodeURIComponent(target)}&dt=t&q=${encodeURIComponent(text)}`;
-	let lastError = null;
-
-	for (let attempt = 0; attempt < 2; attempt += 1) {
-		try {
-			const response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-			if (!response.ok) {
-				throw new Error(`HTTP ${response.status}`);
-			}
-			const data = await response.json();
-			if (!Array.isArray(data) || !Array.isArray(data[0])) {
-				throw new Error('Unexpected response shape');
-			}
-			const joined = data[0].map((part) => (part && typeof part[0] === 'string' ? part[0] : '')).join('');
-			return joined || null;
-		} catch (e) {
-			lastError = e;
-		}
+async function translateOne(translator, text, source, target) {
+	const options = { from: source, to: target, engine: ENGINE };
+	if (ENGINE_KEY) {
+		options.key = ENGINE_KEY;
 	}
-
-	console.warn(`[SMFX Proxy] Translation request failed: ${lastError ? lastError.message : 'unknown error'}`);
-	return null;
-}
-
-async function translateViaOfficialApi(texts, source, target) {
-	const body = { q: texts, target, format: 'text' };
-	if (source !== 'auto') {
-		body.source = source;
+	if (ENGINE_URL) {
+		options.url = ENGINE_URL;
 	}
 
 	try {
-		const url = `https://translation.googleapis.com/language/translate/v2?key=${encodeURIComponent(process.env.GOOGLE_TRANSLATE_API_KEY)}`;
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body),
-			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS * 2),
-		});
-		if (!response.ok) {
-			throw new Error(`HTTP ${response.status}`);
-		}
-		const data = await response.json();
-		const list = data && data.data && data.data.translations;
-		if (!Array.isArray(list) || list.length !== texts.length) {
-			throw new Error('Unexpected response shape');
-		}
-		return list.map((item) => (item && typeof item.translatedText === 'string' ? item.translatedText : null));
+		const result = await translator(text, options);
+		return typeof result === 'string' && result !== '' ? result : null;
 	} catch (e) {
-		console.warn(`[SMFX Proxy] Translation API request failed: ${e.message}`);
-		return texts.map(() => null);
+		console.warn(`[SMFX Proxy] Translation request failed (${ENGINE}): ${e.message}`);
+		return null;
 	}
 }
 
 async function translateCores(cores, source, target) {
-	if (process.env.GOOGLE_TRANSLATE_API_KEY) {
-		const results = [];
-		for (let start = 0; start < cores.length; start += OFFICIAL_BATCH_SIZE) {
-			const part = await translateViaOfficialApi(cores.slice(start, start + OFFICIAL_BATCH_SIZE), source, target);
-			results.push(...part);
-		}
-		return results;
+	let translator;
+	try {
+		translator = await loadTranslator();
+	} catch (e) {
+		console.warn(`[SMFX Proxy] The "translate" package could not be loaded: ${e.message}`);
+		return cores.map(() => null);
 	}
-	return runPool(cores, (core) => translateViaWeb(core, source, target), CONCURRENCY);
+	return runPool(cores, (core) => translateOne(translator, core, source, target), CONCURRENCY);
 }
 
 async function resolveCores(cores, source, target) {
@@ -252,14 +223,14 @@ function register(app) {
 			return res.status(400).json({ ok: false, error: problem });
 		}
 
-		const target = normalizeLanguage(body.target, false);
+		const target = normalizeLanguage(body.target);
 		if (!target) {
 			return res.status(400).json({ ok: false, error: 'The "target" field must be a valid language code.' });
 		}
 
-		const source = body.source === undefined ? DEFAULT_SOURCE : normalizeLanguage(body.source, true);
+		const source = body.source === undefined ? DEFAULT_SOURCE : normalizeLanguage(body.source);
 		if (!source) {
-			return res.status(400).json({ ok: false, error: 'The "source" field must be a valid language code or "auto".' });
+			return res.status(400).json({ ok: false, error: 'The "source" field must be a valid language code.' });
 		}
 
 		try {
