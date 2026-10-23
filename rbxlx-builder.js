@@ -296,10 +296,12 @@ function emitNode(node, out, nodes, diag, insideHeld) {
 	const isLighting = node.className === 'Lighting';
 	const isMaterialService = node.className === 'MaterialService';
 	const isTerrain = node.className === 'Terrain';
+	const isHumanoid = node.className === 'Humanoid';
 
 	const entries = [];
 	for (const [propName, prop] of Object.entries(node.properties)) {
 		if (isLighting && (propName === 'LightingStyle' || propName === 'Technology')) continue;
+		if (isHumanoid && propName === 'AutomaticScalingEnabled') continue;
 		if (isMaterialService && propName === 'Use2022MaterialsXml') continue;
 		if (isTerrain && propName === 'Decoration') continue;
 		if (!prop || typeof prop !== 'object') continue;
@@ -366,6 +368,12 @@ function emitNode(node, out, nodes, diag, insideHeld) {
 		// Use2022MaterialsXml = true -- materiais PBR de 2022.
 		// Forcado aqui pra nao depender do API dump do Lua ter essa property.
 		out.push("<bool name='Use2022MaterialsXml'>true</bool>");
+	}
+
+	if (isHumanoid) {
+		// Sizes and joints are already saved at their final scale; letting the engine apply the scale
+		// values again on load makes R15 rigs deformed or giant.
+		out.push("<bool name='AutomaticScalingEnabled'>false</bool>");
 	}
 
 	if (isTerrain) {

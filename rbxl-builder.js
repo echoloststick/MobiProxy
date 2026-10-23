@@ -375,6 +375,9 @@ const FORCED = {
 	Lighting: { LightingStyle: { kind: 'token', value: 0 }, Technology: { kind: 'token', value: 4 } },
 	MaterialService: { Use2022MaterialsXml: { kind: 'bool', value: true } },
 	Terrain: { Decoration: { kind: 'bool', value: true } },
+	// Part sizes and joints are already saved at their final scale; letting the engine apply the
+	// scale values again on load makes R15 rigs deformed or giant.
+	Humanoid: { AutomaticScalingEnabled: { kind: 'bool', value: false } },
 };
 
 // Properties typed as the newer Content datatype use a different binary type; the legacy ContentId
