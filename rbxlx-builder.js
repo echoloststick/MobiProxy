@@ -48,6 +48,9 @@ function cdata(s) {
 }
 
 const SCRIPT_CLASSES = new Set(['Script', 'LocalScript', 'ModuleScript']);
+// Parts inside these containers are welded to the character at runtime and must never be anchored,
+// otherwise the Handle stays where it was published and the tool looks invisible.
+const HELD_CLASSES = new Set(['Tool', 'Accessory', 'Hat']);
 const isFiniteNumber = (v) => typeof v === 'number' && Number.isFinite(v);
 
 // Validates the VALUE (not the generated text), so a legitimate string such as an object named
@@ -275,7 +278,8 @@ function assignReferents(node, counter) {
 	for (const child of node.children) assignReferents(child, counter);
 }
 
-function emitNode(node, out, nodes, diag) {
+function emitNode(node, out, nodes, diag, insideHeld) {
+	const held = insideHeld || HELD_CLASSES.has(node.className);
 	out.push(`<Item class='${esc(node.className)}' referent='${node.referent}'>`);
 	out.push('<Properties>');
 
@@ -314,6 +318,9 @@ function emitNode(node, out, nodes, diag) {
 	const written = new Set();
 	for (const [propName, prop] of entries) {
 		let { kind, value } = prop;
+		if (held && propName === 'Anchored' && kind === 'bool' && BASEPART_CLASSES.has(node.className)) {
+			value = false;
+		}
 
 		if (kind === 'ref') {
 			if (propName !== 'Parent') { // Parent ja virou aninhamento, nao precisa de <Ref>
@@ -376,7 +383,7 @@ function emitNode(node, out, nodes, diag) {
 
 	out.push('</Properties>');
 
-	for (const child of node.children) emitNode(child, out, nodes, diag);
+	for (const child of node.children) emitNode(child, out, nodes, diag, held);
 
 	out.push('</Item>');
 }
@@ -418,12 +425,18 @@ function build(objects) {
 	for (const root of roots) emitNode(root, out, nodes, diag);
 	out.push('</roblox>');
 
-	const orphans = Object.keys(nodes).length - counter.n;
+	const lost = Object.entries(nodes).filter(([, n]) => !n.referent);
+	const orphans = lost.length;
 	if (diag.skipped > 0) {
 		console.warn(`[rbxlx-builder] ${diag.skipped} property value(s) were invalid and skipped (e.g. ${diag.samples.join(', ')}).`);
 	}
 	if (orphans > 0) {
-		console.warn(`[rbxlx-builder] ${orphans} instance(s) were not reachable from a service and were left out of the place file.`);
+		const names = lost.slice(0, 5).map(([id, n]) => {
+			const name = n.properties.Name && typeof n.properties.Name.value === 'string' ? n.properties.Name.value : '?';
+			const parent = n.properties.Parent && n.properties.Parent.value ? n.properties.Parent.value.ref : '?';
+			return `${n.className} "${name}" (id ${id}, missing parent ${parent})`;
+		});
+		console.warn(`[rbxlx-builder] ${orphans} instance(s) were not reachable from a service and were left out of the place file, e.g. ${names.join('; ')}.`);
 	}
 	return { xml: out.join(''), items: counter.n, skipped: diag.skipped, orphans };
 }
