@@ -382,9 +382,6 @@ const FORCED = {
 const isNewContentProperty = (name) => /Content$/.test(name);
 
 const SCRIPT_CLASSES = new Set(['Script', 'LocalScript', 'ModuleScript']);
-// Parts inside these containers are welded to the character at runtime and must never be anchored,
-// otherwise the Handle stays where it was published and the tool looks invisible.
-const HELD_CLASSES = new Set(['Tool', 'Accessory', 'Hat']);
 
 // ---------------------------------------------------------------------------
 // Tree
@@ -473,15 +470,13 @@ function buildRBXL(objects, defaultsByClass) {
 		source = { ...objects, __MaterialService: { className: 'MaterialService', properties: {} } };
 	}
 
-	const tree = buildTree(source);
-	const { roots } = orderTree(tree.roots);
+	const { roots } = orderTree(buildTree(source).roots);
 	const ordered = [];
-	const walk = (node, insideHeld) => {
-		node.held = insideHeld || HELD_CLASSES.has(node.className);
+	const walk = (node) => {
 		ordered.push(node);
-		node.children.forEach((child) => walk(child, node.held));
+		node.children.forEach(walk);
 	};
-	roots.forEach((root) => walk(root, false));
+	roots.forEach(walk);
 
 	const referentById = new Map();
 	ordered.forEach((node, index) => {
@@ -579,9 +574,7 @@ function buildRBXL(objects, defaultsByClass) {
 				const own = node.properties[name];
 				const dflt = defaults[className] && defaults[className][name];
 				const usable = [own, dflt].find((p) => p && typeof p === 'object' && p.kind === first.kind && validate(p.value));
-				if (name === 'Anchored' && node.held && first.kind === 'bool' && BASEPART_CLASSES.has(className)) {
-					values.push(false);
-				} else if (usable) {
+				if (usable) {
 					values.push(usable.value);
 				} else {
 					values.push(fallbackFor(name, first.kind));
@@ -623,17 +616,8 @@ function buildRBXL(objects, defaultsByClass) {
 	header.writeInt32LE(ordered.length, 20);
 
 	const buffer = Buffer.concat([header, metaChunk(), ...chunks]);
-	const placed = new Set(ordered.map((n) => n.id));
-	const lost = [...tree.nodes.values()].filter((n) => !placed.has(n.id));
-	const orphans = lost.length;
-	if (orphans > 0) {
-		const names = lost.slice(0, 5).map((n) => {
-			const name = n.properties.Name && typeof n.properties.Name.value === 'string' ? n.properties.Name.value : '?';
-			const parent = n.properties.Parent && n.properties.Parent.value ? n.properties.Parent.value.ref : '?';
-			return `${n.className} "${name}" (id ${n.id}, missing parent ${parent})`;
-		});
-		warnings.push(`${orphans} instance(s) were not reachable from a service and were left out of the place file, e.g. ${names.join('; ')}.`);
-	}
+	const orphans = Object.keys(source).length - ordered.length;
+	if (orphans > 0) warnings.push(`${orphans} instance(s) were not reachable from a service and were left out of the place file.`);
 	for (const w of warnings.slice(0, 20)) console.warn('[rbxl-builder] ' + w);
 	return { buffer, items: ordered.length, classes: classes.size, warnings, orphans };
 }
