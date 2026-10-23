@@ -200,7 +200,7 @@ function zigzag64Array(values) {
 // Property types: each encoder receives the list of per-instance values
 // ---------------------------------------------------------------------------
 
-const T = { String: 0x01, Bool: 0x02, Int32: 0x03, Float: 0x04, Double: 0x05, UDim: 0x06, UDim2: 0x07, BrickColor: 0x0b, Color3: 0x0c, Vector2: 0x0d, Vector3: 0x0e, CFrame: 0x10, Enum: 0x12, Ref: 0x13, NumberSequence: 0x15, ColorSequence: 0x16, NumberRange: 0x17, PhysicalProperties: 0x19, Int64: 0x1b };
+const T = { String: 0x01, Bool: 0x02, Int32: 0x03, Float: 0x04, Double: 0x05, UDim: 0x06, UDim2: 0x07, BrickColor: 0x0b, Color3: 0x0c, Vector2: 0x0d, Vector3: 0x0e, CFrame: 0x10, Enum: 0x12, Ref: 0x13, NumberSequence: 0x15, ColorSequence: 0x16, NumberRange: 0x17, PhysicalProperties: 0x19, Color3uint8: 0x1a, Int64: 0x1b };
 
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
 
@@ -225,6 +225,14 @@ const ENCODERS = {
 	Color3: {
 		type: T.Color3,
 		encode: (vs) => Buffer.concat([floatArray(vs.map((v) => num(v.r))), floatArray(vs.map((v) => num(v.g))), floatArray(vs.map((v) => num(v.b)))]),
+	},
+	// Used for BasePart.Color: three byte planes (all R, then all G, then all B), as in Studio files.
+	Color3uint8: {
+		type: T.Color3uint8,
+		encode: (vs) => {
+			const to8 = (x) => Math.max(0, Math.min(255, Math.round(num(x) * 255)));
+			return Buffer.from([...vs.map((v) => to8(v.r)), ...vs.map((v) => to8(v.g)), ...vs.map((v) => to8(v.b))]);
+		},
 	},
 	UDim: {
 		type: T.UDim,
@@ -304,7 +312,58 @@ const NOT_SERIALIZED = new Set([
 	'ClassName', 'Sandboxed', 'DistributedGameTime', 'InsertPoint', 'ReceiveAge', 'Mass', 'CenterOfMass',
 	'ExtentsCFrame', 'ExtentsSize', 'CurrentPhysicalProperties', 'LocalTransparencyModifier',
 	'AssemblyLinearVelocity', 'AssemblyAngularVelocity', 'ClassicChat', 'BubbleChat', 'Parent',
+	// Derived or read-only values. Applied at load time (before the parent exists) they would move
+	// attachments or give parts an initial velocity.
+	'WorldCFrame', 'WorldPosition', 'WorldOrientation', 'WorldAxis', 'WorldSecondaryAxis',
+	'AssemblyMass', 'AssemblyCenterOfMass', 'AssemblyRootPart', 'Velocity', 'RotVelocity',
 ]);
+
+// BasePart.Color is stored by Studio as Color3uint8 (property name "Color3uint8"), next to BrickColor.
+const BASEPART_CLASSES = new Set([
+	'Part', 'MeshPart', 'WedgePart', 'CornerWedgePart', 'TrussPart', 'UnionOperation', 'NegateOperation',
+	'IntersectOperation', 'SpawnLocation', 'Seat', 'VehicleSeat', 'FlagStand', 'SkateboardPlatform',
+]);
+
+// BrickColor snaps Color to the nearest palette entry, so it has to be applied BEFORE Color3uint8.
+// Properties come from a Lua pairs() loop, so without sorting the order was random and some parts
+// randomly lost their exact color.
+function propOrder(name) {
+	if (name === 'BrickColor') return 1;
+	if (name === 'Color' || name === 'Color3uint8') return 3;
+	return 2;
+}
+
+// A column has to hold a value for every instance of the class. When one instance has no usable value
+// (and no default was sent), the old code dropped the WHOLE column, so every Part of the class lost its
+// Size or Color. Now only that instance receives one of these fallbacks, which mirror engine defaults.
+const KIND_FALLBACK = {
+	string: '', Content: '', bool: false, int: 0, int64: 0, float: 0, double: 0, token: 0,
+	BrickColor: { number: 194 }, Vector2: { x: 0, y: 0 }, Vector3: { x: 0, y: 0, z: 0 },
+	CFrame: { c: [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1] }, Color3: { r: 1, g: 1, b: 1 },
+	UDim: { scale: 0, offset: 0 }, UDim2: { x: { scale: 0, offset: 0 }, y: { scale: 0, offset: 0 } },
+	NumberRange: { min: 0, max: 0 }, NumberSequence: { keypoints: [{ t: 0, v: 0, e: 0 }, { t: 1, v: 0, e: 0 }] },
+	ColorSequence: { keypoints: [{ t: 0, r: 1, g: 1, b: 1 }, { t: 1, r: 1, g: 1, b: 1 }] },
+	PhysicalProperties: null,
+};
+const PROP_FALLBACK = {
+	Size: { kind: 'Vector3', value: { x: 4, y: 1, z: 2 } },
+	Color: { kind: 'Color3', value: { r: 163 / 255, g: 162 / 255, b: 165 / 255 } },
+	BrickColor: { kind: 'BrickColor', value: { number: 194 } },
+	Material: { kind: 'token', value: 256 },
+	TopSurface: { kind: 'token', value: 3 },
+	BottomSurface: { kind: 'token', value: 4 },
+	CanCollide: { kind: 'bool', value: true },
+	CanTouch: { kind: 'bool', value: true },
+	CanQuery: { kind: 'bool', value: true },
+	CastShadow: { kind: 'bool', value: true },
+	Visible: { kind: 'bool', value: true },
+	Enabled: { kind: 'bool', value: true },
+};
+function fallbackFor(name, kind) {
+	const specific = PROP_FALLBACK[name];
+	if (specific && specific.kind === kind) return specific.value;
+	return KIND_FALLBACK[kind];
+}
 
 // Studio writes these two with the Internal suffix.
 const FILE_NAME = {
@@ -323,6 +382,9 @@ const FORCED = {
 const isNewContentProperty = (name) => /Content$/.test(name);
 
 const SCRIPT_CLASSES = new Set(['Script', 'LocalScript', 'ModuleScript']);
+// Parts inside these containers are welded to the character at runtime and must never be anchored,
+// otherwise the Handle stays where it was published and the tool looks invisible.
+const HELD_CLASSES = new Set(['Tool', 'Accessory', 'Hat']);
 
 // ---------------------------------------------------------------------------
 // Tree
@@ -403,6 +465,7 @@ function valueOf(node, propName, defaults) {
 
 function buildRBXL(objects, defaultsByClass) {
 	const defaults = defaultsByClass && typeof defaultsByClass === 'object' ? defaultsByClass : {};
+	const warnings = [];
 
 	// Terrain and MaterialService need to exist so the forced properties have somewhere to live.
 	let source = objects;
@@ -410,13 +473,15 @@ function buildRBXL(objects, defaultsByClass) {
 		source = { ...objects, __MaterialService: { className: 'MaterialService', properties: {} } };
 	}
 
-	const { roots } = orderTree(buildTree(source).roots);
+	const tree = buildTree(source);
+	const { roots } = orderTree(tree.roots);
 	const ordered = [];
-	const walk = (node) => {
+	const walk = (node, insideHeld) => {
+		node.held = insideHeld || HELD_CLASSES.has(node.className);
 		ordered.push(node);
-		node.children.forEach(walk);
+		node.children.forEach((child) => walk(child, node.held));
 	};
-	roots.forEach(walk);
+	roots.forEach((root) => walk(root, false));
 
 	const referentById = new Map();
 	ordered.forEach((node, index) => {
@@ -476,12 +541,18 @@ function buildRBXL(objects, defaultsByClass) {
 			chunks.push(chunk('PROP', Buffer.concat([u32(classId), str('Source'), Buffer.from([T.String]), ENCODERS.string.encode(sources)])));
 		}
 
-		for (const name of propNames) {
+		for (const name of [...propNames].sort((a, b) => propOrder(a) - propOrder(b))) {
 			if (isNewContentProperty(name)) continue;
 			if (name === 'Source' && SCRIPT_CLASSES.has(className)) continue;
+			// BasePart Position/Orientation/Rotation are derived from CFrame.
+			if (BASEPART_CLASSES.has(className) && (name === 'Position' || name === 'Orientation' || name === 'Rotation')) continue;
 
 			// Reference properties are written as referents; unresolved ones become null (-1).
-			const first = instances.map((n) => n.properties[name]).find((p) => p && typeof p === 'object');
+			// The column type comes from the first instance with a VALID value, so one bad value on
+			// the first instance no longer discards the whole column.
+			const first = instances
+				.map((n) => n.properties[name])
+				.find((p) => p && typeof p === 'object' && (p.kind === 'ref' || (VALIDATORS[p.kind] && VALIDATORS[p.kind](p.value))));
 			if (!first) continue;
 
 			if (first.kind === 'ref') {
@@ -494,35 +565,41 @@ function buildRBXL(objects, defaultsByClass) {
 				continue;
 			}
 
-			const encoder = ENCODERS[first.kind];
 			const validate = VALIDATORS[first.kind];
+			// BasePart.Color goes to the file as Color3uint8, like Studio does.
+			const asColor3uint8 = name === 'Color' && first.kind === 'Color3' && BASEPART_CLASSES.has(className);
+			const encoder = asColor3uint8 ? ENCODERS.Color3uint8 : ENCODERS[first.kind];
+			const fileName = asColor3uint8 ? 'Color3uint8' : nameFor(className, name);
 			if (!encoder || !validate) continue;
 
 			const values = [];
-			let complete = true;
+			let fallbackCount = 0;
 			for (const node of instances) {
-				let prop = valueOf(node, name, defaults);
-				if (prop && prop.kind !== first.kind) prop = null;
-				if (prop && !validate(prop.value)) prop = null;
-				if (!prop) {
-					if (first.kind === 'PhysicalProperties') {
-						values.push(null);
-						continue;
-					}
-					complete = false;
-					break;
+				// Own value first, then the class default, then a fallback for this instance only.
+				const own = node.properties[name];
+				const dflt = defaults[className] && defaults[className][name];
+				const usable = [own, dflt].find((p) => p && typeof p === 'object' && p.kind === first.kind && validate(p.value));
+				if (name === 'Anchored' && node.held && first.kind === 'bool' && BASEPART_CLASSES.has(className)) {
+					values.push(false);
+				} else if (usable) {
+					values.push(usable.value);
+				} else {
+					values.push(fallbackFor(name, first.kind));
+					fallbackCount++;
 				}
-				values.push(prop.value);
 			}
-			if (!complete) continue;
+			if (fallbackCount > 0) {
+				warnings.push(`${className}.${name}: ${fallbackCount} of ${instances.length} instance(s) had no usable value; a fallback value was written for them.`);
+			}
 
 			let payload;
 			try {
 				payload = encoder.encode(values);
 			} catch (e) {
+				warnings.push(`${className}.${name}: property could not be encoded and was skipped (${e.message}).`);
 				continue;
 			}
-			chunks.push(chunk('PROP', Buffer.concat([u32(classId), str(nameFor(className, name)), Buffer.from([encoder.type]), payload])));
+			chunks.push(chunk('PROP', Buffer.concat([u32(classId), str(fileName), Buffer.from([encoder.type]), payload])));
 		}
 	}
 
@@ -546,7 +623,19 @@ function buildRBXL(objects, defaultsByClass) {
 	header.writeInt32LE(ordered.length, 20);
 
 	const buffer = Buffer.concat([header, metaChunk(), ...chunks]);
-	return { buffer, items: ordered.length, classes: classes.size };
+	const placed = new Set(ordered.map((n) => n.id));
+	const lost = [...tree.nodes.values()].filter((n) => !placed.has(n.id));
+	const orphans = lost.length;
+	if (orphans > 0) {
+		const names = lost.slice(0, 5).map((n) => {
+			const name = n.properties.Name && typeof n.properties.Name.value === 'string' ? n.properties.Name.value : '?';
+			const parent = n.properties.Parent && n.properties.Parent.value ? n.properties.Parent.value.ref : '?';
+			return `${n.className} "${name}" (id ${n.id}, missing parent ${parent})`;
+		});
+		warnings.push(`${orphans} instance(s) were not reachable from a service and were left out of the place file, e.g. ${names.join('; ')}.`);
+	}
+	for (const w of warnings.slice(0, 20)) console.warn('[rbxl-builder] ' + w);
+	return { buffer, items: ordered.length, classes: classes.size, warnings, orphans };
 }
 
 module.exports = { buildRBXL, lz4Compress, lz4Decompress };
