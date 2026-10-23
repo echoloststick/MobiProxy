@@ -15,28 +15,7 @@ const ILLEGAL_XML_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]|
 function esc(s) {
 	return String(s)
 		.replace(ILLEGAL_XML_CHARS, '')
-		.replace(/[&<>'"]/g, (c) => XML_ESCAPE[c])
-		// A raw carriage return is normalised to \n by every XML parser, so it has to be a character reference.
-		.replace(/\r/g, '&#13;');
-}
-
-const toInt32 = (v) => Math.max(-2147483648, Math.min(2147483647, Math.trunc(v)));
-const toUint32 = (v) => Math.max(0, Math.min(4294967295, Math.trunc(v)));
-
-// BasePart.Color is stored by Studio as Color3uint8 (property name "Color3uint8"), next to BrickColor.
-const BASEPART_CLASSES = new Set([
-	'Part', 'MeshPart', 'WedgePart', 'CornerWedgePart', 'TrussPart', 'UnionOperation', 'NegateOperation',
-	'IntersectOperation', 'SpawnLocation', 'Seat', 'VehicleSeat', 'FlagStand', 'SkateboardPlatform',
-]);
-
-// Load order matters: BrickColor snaps Color to the nearest palette entry, so it must be applied BEFORE
-// Color3uint8. Properties come from a Lua pairs() loop, so without sorting the order was random and some
-// parts randomly lost their exact color.
-function propOrder(name) {
-	if (name === 'Name') return 0;
-	if (name === 'BrickColor') return 1;
-	if (name === 'Color' || name === 'Color3uint8') return 3;
-	return 2;
+		.replace(/[&<>'"]/g, (c) => XML_ESCAPE[c]);
 }
 
 // Script source goes inside CDATA, the same way Studio writes it. This keeps the text byte-for-byte
@@ -75,7 +54,6 @@ function isValidValue(kind, value) {
 		case 'CFrame':
 			return !!value && Array.isArray(value.c) && value.c.length >= 12 && value.c.slice(0, 12).every(isFiniteNumber);
 		case 'Color3':
-		case 'Color3uint8':
 			return !!value && isFiniteNumber(value.r) && isFiniteNumber(value.g) && isFiniteNumber(value.b);
 		case 'UDim':
 			return !!value && isFiniteNumber(value.scale) && isFiniteNumber(value.offset);
@@ -101,10 +79,6 @@ const NOT_SERIALIZED = new Set([
 	'ClassName', 'Sandboxed', 'DistributedGameTime', 'InsertPoint', 'ReceiveAge', 'Mass', 'CenterOfMass',
 	'ExtentsCFrame', 'ExtentsSize', 'CurrentPhysicalProperties', 'LocalTransparencyModifier',
 	'AssemblyLinearVelocity', 'AssemblyAngularVelocity', 'ClassicChat', 'BubbleChat',
-	// Derived or read-only values. Applied at load time (before the parent exists) they would move
-	// attachments or give parts an initial velocity.
-	'WorldCFrame', 'WorldPosition', 'WorldOrientation', 'WorldAxis', 'WorldSecondaryAxis',
-	'AssemblyMass', 'AssemblyCenterOfMass', 'AssemblyRootPart', 'Velocity', 'RotVelocity',
 ]);
 
 // Nome da property no arquivo (o Studio grava esses dois com sufixo Internal).
@@ -133,15 +107,15 @@ function propertyXML(propName, kind, value) {
 		case 'string':
 			return `<string name='${n}'>${esc(value)}</string>`;
 		case 'int':
-			return `<int name='${n}'>${toInt32(value)}</int>`;
+			return `<int name='${n}'>${Math.trunc(value)}</int>`;
 		case 'int64':
-			return `<int64 name='${n}'>${BigInt(Math.trunc(value))}</int64>`;
+			return `<int64 name='${n}'>${Math.trunc(value)}</int64>`;
 		case 'float':
 			return `<float name='${n}'>${value}</float>`;
 		case 'double':
 			return `<double name='${n}'>${value}</double>`;
 		case 'token':
-			return `<token name='${n}'>${toUint32(value)}</token>`;
+			return `<token name='${n}'>${Math.trunc(value)}</token>`;
 
 		case 'Vector3':
 			return `<Vector3 name='${n}'><X>${value.x}</X><Y>${value.y}</Y><Z>${value.z}</Z></Vector3>`;
@@ -158,17 +132,12 @@ function propertyXML(propName, kind, value) {
 		}
 		case 'Color3':
 			return `<Color3 name='${n}'><R>${value.r}</R><G>${value.g}</G><B>${value.b}</B></Color3>`;
-		case 'Color3uint8': {
-			const to8 = (x) => Math.max(0, Math.min(255, Math.round(x * 255)));
-			const packed = (0xff000000 | (to8(value.r) << 16) | (to8(value.g) << 8) | to8(value.b)) >>> 0;
-			return `<Color3uint8 name='${n}'>${packed}</Color3uint8>`;
-		}
 		case 'UDim':
-			return `<UDim name='${n}'><S>${value.scale}</S><O>${toInt32(value.offset)}</O></UDim>`;
+			return `<UDim name='${n}'><S>${value.scale}</S><O>${Math.trunc(value.offset)}</O></UDim>`;
 		case 'UDim2':
 			return (
-				`<UDim2 name='${n}'><XS>${value.x.scale}</XS><XO>${toInt32(value.x.offset)}</XO>` +
-				`<YS>${value.y.scale}</YS><YO>${toInt32(value.y.offset)}</YO></UDim2>`
+				`<UDim2 name='${n}'><XS>${value.x.scale}</XS><XO>${Math.trunc(value.x.offset)}</XO>` +
+				`<YS>${value.y.scale}</YS><YO>${Math.trunc(value.y.offset)}</YO></UDim2>`
 			);
 		case 'NumberRange':
 			return `<NumberRange name='${n}'>${value.min} ${value.max}</NumberRange>`;
@@ -181,7 +150,7 @@ function propertyXML(propName, kind, value) {
 			return `<ColorSequence name='${n}'>${parts}</ColorSequence>`;
 		}
 		case 'BrickColor':
-			return `<int name='${n}'>${toInt32(value.number)}</int>`;
+			return `<int name='${n}'>${Math.trunc(value.number)}</int>`;
 		case 'PhysicalProperties':
 			if (value == null) {
 				return `<PhysicalProperties name='${n}'><CustomPhysics>false</CustomPhysics></PhysicalProperties>`;
@@ -194,8 +163,6 @@ function propertyXML(propName, kind, value) {
 				`<ElasticityWeight>${value.elasticityWeight}</ElasticityWeight></PhysicalProperties>`
 			);
 		case 'Content':
-			// Empty content must be <null/>; esc(null) would have written the literal URL "null".
-			if (value == null || value === '') return `<Content name='${n}'><null></null></Content>`;
 			return `<Content name='${n}'><url>${esc(value)}</url></Content>`;
 		default:
 			return null; // kind desconhecido -- ignora em vez de quebrar o publish inteiro
@@ -243,7 +210,6 @@ function sortChildrenRecursive(node) {
 function buildTree(objects) {
 	const nodes = {};
 	for (const [idStr, data] of Object.entries(objects)) {
-		if (!data || typeof data.className !== 'string') continue;
 		nodes[idStr] = {
 			className: data.className,
 			properties: data.properties || {},
@@ -259,7 +225,7 @@ function buildTree(objects) {
 		if (parentProp && parentProp.kind === 'ref' && parentProp.value && parentProp.value.ref != null) {
 			parentNode = nodes[String(parentProp.value.ref)];
 		}
-		if (parentNode && parentNode !== node) {
+		if (parentNode) {
 			parentNode.children.push(node);
 		} else {
 			roots.push(node); // sem pai reconhecido (services raiz) vira raiz do arquivo
@@ -275,7 +241,7 @@ function assignReferents(node, counter) {
 	for (const child of node.children) assignReferents(child, counter);
 }
 
-function emitNode(node, out, nodes, diag) {
+function emitNode(node, out, nodes) {
 	out.push(`<Item class='${esc(node.className)}' referent='${node.referent}'>`);
 	out.push('<Properties>');
 
@@ -293,7 +259,6 @@ function emitNode(node, out, nodes, diag) {
 	const isMaterialService = node.className === 'MaterialService';
 	const isTerrain = node.className === 'Terrain';
 
-	const entries = [];
 	for (const [propName, prop] of Object.entries(node.properties)) {
 		if (isLighting && (propName === 'LightingStyle' || propName === 'Technology')) continue;
 		if (isMaterialService && propName === 'Use2022MaterialsXml') continue;
@@ -303,17 +268,7 @@ function emitNode(node, out, nodes, diag) {
 		// Script source is written once, below, as a ProtectedString. If the Lua side also listed
 		// "Source" as a regular property, writing it here would produce a duplicate <string> entry.
 		if (propName === 'Source' && SCRIPT_CLASSES.has(node.className)) continue;
-		// BasePart Position/Orientation/Rotation are derived from CFrame; applying them in a random
-		// order next to CFrame can move or rotate the part.
-		if (prop.kind === 'Vector3' && BASEPART_CLASSES.has(node.className) &&
-			(propName === 'Position' || propName === 'Orientation' || propName === 'Rotation')) continue;
-		entries.push([propName, prop]);
-	}
-	entries.sort((a, b) => propOrder(a[0]) - propOrder(b[0]));
-
-	const written = new Set();
-	for (const [propName, prop] of entries) {
-		let { kind, value } = prop;
+		const { kind, value } = prop;
 
 		if (kind === 'ref') {
 			if (propName !== 'Parent') { // Parent ja virou aninhamento, nao precisa de <Ref>
@@ -323,26 +278,14 @@ function emitNode(node, out, nodes, diag) {
 				out.push(`<Ref name='${esc(propName)}'>${targetReferent}</Ref>`);
 			}
 		} else {
-			let fileName = (FILE_NAME[node.className] && FILE_NAME[node.className][propName]) || propName;
-			if (propName === 'Color' && kind === 'Color3' && BASEPART_CLASSES.has(node.className)) {
-				fileName = 'Color3uint8';
-				kind = 'Color3uint8';
-			}
-			if (written.has(fileName)) continue; // never emit the same property twice
 			try {
+				const fileName = (FILE_NAME[node.className] && FILE_NAME[node.className][propName]) || propName;
 				if (isValidValue(kind, value)) {
 					const xml = propertyXML(fileName, kind, value);
-					if (xml) {
-						out.push(xml);
-						written.add(fileName);
-					}
-				} else {
-					diag.skipped++;
-					if (diag.samples.length < 10) diag.samples.push(`${node.className}.${propName} (${kind})`);
+					if (xml) out.push(xml);
 				}
 			} catch (e) {
-				diag.skipped++;
-				if (diag.samples.length < 10) diag.samples.push(`${node.className}.${propName} (${kind}): ${e.message}`);
+				// valor invalido -- pula so essa property
 			}
 		}
 	}
@@ -376,7 +319,7 @@ function emitNode(node, out, nodes, diag) {
 
 	out.push('</Properties>');
 
-	for (const child of node.children) emitNode(child, out, nodes, diag);
+	for (const child of node.children) emitNode(child, out, nodes);
 
 	out.push('</Item>');
 }
@@ -414,18 +357,9 @@ function build(objects) {
 			'xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">',
 		'<Meta name="ExplicitAutoJoints">true</Meta>',
 	];
-	const diag = { skipped: 0, samples: [] };
-	for (const root of roots) emitNode(root, out, nodes, diag);
+	for (const root of roots) emitNode(root, out, nodes);
 	out.push('</roblox>');
-
-	const orphans = Object.keys(nodes).length - counter.n;
-	if (diag.skipped > 0) {
-		console.warn(`[rbxlx-builder] ${diag.skipped} property value(s) were invalid and skipped (e.g. ${diag.samples.join(', ')}).`);
-	}
-	if (orphans > 0) {
-		console.warn(`[rbxlx-builder] ${orphans} instance(s) were not reachable from a service and were left out of the place file.`);
-	}
-	return { xml: out.join(''), items: counter.n, skipped: diag.skipped, orphans };
+	return { xml: out.join(''), items: counter.n };
 }
 
 function buildRBXLX(objects) {
@@ -434,8 +368,8 @@ function buildRBXLX(objects) {
 
 // Compatibilidade com main.js que ainda importa buildRBXLXReport.
 function buildRBXLXReport(objects) {
-	const { xml, items, skipped, orphans } = build(objects);
-	return { xml, stats: { items, bytes: Buffer.byteLength(xml, 'utf8'), skipped, orphans } };
+	const { xml, items } = build(objects);
+	return { xml, stats: { items, bytes: Buffer.byteLength(xml, 'utf8') } };
 }
 
 module.exports = { buildRBXLX, buildRBXLXReport };
