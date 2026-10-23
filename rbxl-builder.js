@@ -315,7 +315,7 @@ const NOT_SERIALIZED = new Set([
 	// Derived or read-only values. Applied at load time (before the parent exists) they would move
 	// attachments or give parts an initial velocity.
 	'WorldCFrame', 'WorldPosition', 'WorldOrientation', 'WorldAxis', 'WorldSecondaryAxis',
-	'AssemblyMass', 'AssemblyCenterOfMass', 'AssemblyRootPart', 'Velocity', 'RotVelocity',
+	'AssemblyMass', 'AssemblyCenterOfMass', 'AssemblyRootPart', 'Velocity', 'RotVelocity', 'MeshSize',
 ]);
 
 // BasePart.Color is stored by Studio as Color3uint8 (property name "Color3uint8"), next to BrickColor.
@@ -466,27 +466,39 @@ function valueOf(node, propName, defaults) {
 	return classDefaults && classDefaults[propName] && typeof classDefaults[propName] === 'object' ? classDefaults[propName] : null;
 }
 
+// A MeshPart without InitialSize gets its mesh scale from whatever Size it has when the mesh asset
+// finishes loading, so rigs and accessories come out differently on every join. InitialSize is the
+// mesh's native size, which the save stores as MeshSize.
+const isVec3 = (v) => !!v && Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z) && v.x > 0 && v.y > 0 && v.z > 0;
 
-// R15 scale NumberValues make the engine rescale parts and accessories in load order, which is not
-// deterministic. Parts are already saved at their final size, so these values are left out of the file.
-const SCALE_VALUE_NAMES = new Set(['BodyDepthScale', 'BodyHeightScale', 'BodyWidthScale', 'HeadScale', 'BodyTypeScale', 'BodyProportionScale']);
-
-function stripScaleValues(objects) {
+function prepareObjects(objects, fillMissing) {
 	const result = {};
+	let anyMeshSize = false;
 	for (const [id, data] of Object.entries(objects)) {
-		if (data && data.className === 'NumberValue') {
-			const name = data.properties && data.properties.Name && data.properties.Name.value;
-			const parentRef = data.properties && data.properties.Parent && data.properties.Parent.value && data.properties.Parent.value.ref;
-			const parent = parentRef != null ? objects[String(parentRef)] : null;
-			if (SCALE_VALUE_NAMES.has(name) && parent && parent.className === 'Humanoid') continue;
-		}
 		result[id] = data;
+		if (data && data.className === 'MeshPart' && data.properties && !data.properties.InitialSize) {
+			const mesh = data.properties.MeshSize;
+			if (mesh && mesh.kind === 'Vector3' && isVec3(mesh.value)) {
+				anyMeshSize = true;
+				result[id] = { ...data, properties: { ...data.properties, InitialSize: mesh } };
+			}
+		}
+	}
+	if (fillMissing && anyMeshSize) {
+		for (const [id, data] of Object.entries(result)) {
+			if (data && data.className === 'MeshPart' && data.properties && !data.properties.InitialSize) {
+				const size = data.properties.Size;
+				if (size && size.kind === 'Vector3' && isVec3(size.value)) {
+					result[id] = { ...data, properties: { ...data.properties, InitialSize: size } };
+				}
+			}
+		}
 	}
 	return result;
 }
 
 function buildRBXL(rawObjects, defaultsByClass) {
-	const objects = stripScaleValues(rawObjects);
+	const objects = prepareObjects(rawObjects, true);
 	const defaults = defaultsByClass && typeof defaultsByClass === 'object' ? defaultsByClass : {};
 	const warnings = [];
 
