@@ -466,7 +466,27 @@ function valueOf(node, propName, defaults) {
 	return classDefaults && classDefaults[propName] && typeof classDefaults[propName] === 'object' ? classDefaults[propName] : null;
 }
 
-function buildRBXL(objects, defaultsByClass) {
+
+// R15 scale NumberValues make the engine rescale parts and accessories in load order, which is not
+// deterministic. Parts are already saved at their final size, so these values are left out of the file.
+const SCALE_VALUE_NAMES = new Set(['BodyDepthScale', 'BodyHeightScale', 'BodyWidthScale', 'HeadScale', 'BodyTypeScale', 'BodyProportionScale']);
+
+function stripScaleValues(objects) {
+	const result = {};
+	for (const [id, data] of Object.entries(objects)) {
+		if (data && data.className === 'NumberValue') {
+			const name = data.properties && data.properties.Name && data.properties.Name.value;
+			const parentRef = data.properties && data.properties.Parent && data.properties.Parent.value && data.properties.Parent.value.ref;
+			const parent = parentRef != null ? objects[String(parentRef)] : null;
+			if (SCALE_VALUE_NAMES.has(name) && parent && parent.className === 'Humanoid') continue;
+		}
+		result[id] = data;
+	}
+	return result;
+}
+
+function buildRBXL(rawObjects, defaultsByClass) {
+	const objects = stripScaleValues(rawObjects);
 	const defaults = defaultsByClass && typeof defaultsByClass === 'object' ? defaultsByClass : {};
 	const warnings = [];
 

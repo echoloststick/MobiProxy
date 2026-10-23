@@ -396,7 +396,27 @@ function emitNode(node, out, nodes, diag, insideHeld) {
 	out.push('</Item>');
 }
 
-function build(objects) {
+
+// R15 scale NumberValues make the engine rescale parts and accessories in load order, which is not
+// deterministic. Parts are already saved at their final size, so these values are left out of the file.
+const SCALE_VALUE_NAMES = new Set(['BodyDepthScale', 'BodyHeightScale', 'BodyWidthScale', 'HeadScale', 'BodyTypeScale', 'BodyProportionScale']);
+
+function stripScaleValues(objects) {
+	const result = {};
+	for (const [id, data] of Object.entries(objects)) {
+		if (data && data.className === 'NumberValue') {
+			const name = data.properties && data.properties.Name && data.properties.Name.value;
+			const parentRef = data.properties && data.properties.Parent && data.properties.Parent.value && data.properties.Parent.value.ref;
+			const parent = parentRef != null ? objects[String(parentRef)] : null;
+			if (SCALE_VALUE_NAMES.has(name) && parent && parent.className === 'Humanoid') continue;
+		}
+		result[id] = data;
+	}
+	return result;
+}
+
+function build(rawObjects) {
+	const objects = stripScaleValues(rawObjects);
 	// Garante que o MaterialService exista como service raiz, mesmo que o Lua nao o
 	// mande no dict achatado (ele nao aparece naturalmente no DataModel ate ser
 	// tocado). Sem isso, o proxy nao teria onde pendurar o Use2022MaterialsXml forcado.
