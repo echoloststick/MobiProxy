@@ -503,16 +503,37 @@ const TOOLBOX_CATEGORY = { Model: 10, Mesh: 40, Decal: 13 }; // assetTypeId do t
 
 // Ids da categoria MeshPart sao assets-container: o id da mesh de verdade ('MeshId') fica dentro da
 // arvore do asset. Baixa o container (Asset Delivery autenticado, igual ao /asset) e le o MeshId.
-const meshIdCache = new Map(); // containerId -> meshId | null
+const meshIdCache = new Map(); // containerId -> { meshId, tex, sa } | null
 
-function findMeshId(trees) {
+function propId(node, ...names) {
+	for (const n of names) {
+		const raw = node.properties && node.properties[n];
+		const m = raw != null && JSON.stringify(raw).match(/(\d{5,})/);
+		if (m) return Number(m[1]);
+	}
+	return null;
+}
+
+// Devolve { meshId, tex, sa } -- tex = TextureID, sa = mapas do SurfaceAppearance filho (se houver)
+function findMeshInfo(trees) {
 	for (const node of trees || []) {
 		if (String(node.className) === 'MeshPart') {
-			const raw = node.properties && node.properties.MeshId;
-			const m = raw != null && JSON.stringify(raw).match(/(\d{5,})/);
-			if (m) return Number(m[1]);
+			const meshId = propId(node, 'MeshId', 'MeshID');
+			if (meshId) {
+				const info = { meshId, tex: propId(node, 'TextureID', 'TextureId'), sa: null };
+				const sa = (node.children || []).find((c) => String(c.className) === 'SurfaceAppearance');
+				if (sa) {
+					info.sa = {
+						ColorMap: propId(sa, 'ColorMap'),
+						NormalMap: propId(sa, 'NormalMap'),
+						MetalnessMap: propId(sa, 'MetalnessMap'),
+						RoughnessMap: propId(sa, 'RoughnessMap'),
+					};
+				}
+				return info;
+			}
 		}
-		const inner = findMeshId(node.children);
+		const inner = findMeshInfo(node.children);
 		if (inner) return inner;
 	}
 	return null;
@@ -520,7 +541,7 @@ function findMeshId(trees) {
 
 async function resolveMeshId(id, apiKey) {
 	if (meshIdCache.has(id)) return meshIdCache.get(id);
-	let meshId = null;
+	let info = null;
 	try {
 		const locRes = await fetch(`https://apis.roblox.com/asset-delivery-api/v1/assetId/${id}`, {
 			headers: { 'x-api-key': apiKey },
@@ -532,8 +553,8 @@ async function resolveMeshId(id, apiKey) {
 				let raw = Buffer.from(await fileRes.arrayBuffer());
 				if (raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b) raw = zlib.gunzipSync(raw);
 				const head = raw.slice(0, 8).toString('latin1');
-				if (head === '<roblox!') meshId = findMeshId(extractAssetTreesFromBinary(raw));
-				else if (head.startsWith('<roblox')) meshId = findMeshId(extractAssetTreesFromXML(raw.toString('utf8')));
+				if (head === '<roblox!') info = findMeshInfo(extractAssetTreesFromBinary(raw));
+				else if (head.startsWith('<roblox')) info = findMeshInfo(extractAssetTreesFromXML(raw.toString('utf8')));
 			}
 		} else {
 			console.warn(`[SMFX Proxy] /toolbox mesh ${id}: asset-delivery ${locRes.status}`);
@@ -541,8 +562,8 @@ async function resolveMeshId(id, apiKey) {
 	} catch (e) {
 		console.warn(`[SMFX Proxy] /toolbox mesh ${id} falhou:`, e.message);
 	}
-	meshIdCache.set(id, meshId);
-	return meshId;
+	meshIdCache.set(id, info);
+	return info;
 }
 
 app.get('/toolbox', async (req, res) => {
@@ -583,8 +604,8 @@ app.get('/toolbox', async (req, res) => {
 				return res.status(500).json({ error: 'mesh search needs OPEN_CLOUD_API_KEY (legacy-assets:manage) on the proxy' });
 			}
 			const resolved = await Promise.all(items.slice(0, 20).map(async (it) => {
-				const meshId = await resolveMeshId(it.Id, apiKey);
-				return meshId ? { Id: meshId, Thumb: it.Id, Title: it.Title, Sub: '' } : null;
+				const info = await resolveMeshId(it.Id, apiKey);
+				return info ? { Id: info.meshId, Tex: info.tex, SA: info.sa, Thumb: it.Id, Title: it.Title, Sub: '' } : null;
 			}));
 			items = resolved.filter(Boolean);
 		}
