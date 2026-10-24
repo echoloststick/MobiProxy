@@ -499,7 +499,7 @@ app.get('/asset', async (req, res) => {
 // Pesquisa no marketplace e devolve { items: [{ Id, Title, Sub }] } (mesmo formato da busca de audio).
 // COLE em main.js, ANTES de require('./compress'). Nao precisa de API key.
 // ---------------------------------------------------------------------------
-const TOOLBOX_CATEGORY = { Model: 10, Mesh: 4, Decal: 13 }; // assetTypeId do toolbox-service
+const TOOLBOX_CATEGORY = { Model: 10, Mesh: 40, Decal: 13 }; // assetTypeId do toolbox-service
 
 app.get('/toolbox', async (req, res) => {
 	const category = TOOLBOX_CATEGORY[req.query.type];
@@ -513,7 +513,7 @@ app.get('/toolbox', async (req, res) => {
 			`https://apis.roblox.com/toolbox-service/v1/marketplace/${category}?limit=30&keyword=${encodeURIComponent(keyword)}`
 		);
 		if (!listRes.ok) {
-			return res.status(502).json({ error: `toolbox search failed: ${listRes.status}` });
+			return res.status(502).json({ error: `toolbox search failed: ${listRes.status} ${(await listRes.text()).slice(0, 150)}` });
 		}
 		const ids = ((await listRes.json()).data || []).map((d) => d.id).filter((n) => Number.isInteger(n));
 		if (ids.length === 0) {
