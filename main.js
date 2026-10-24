@@ -494,6 +494,48 @@ app.get('/asset', async (req, res) => {
 	});
 });
 
+// ---------------------------------------------------------------------------
+// GET /toolbox?type=Model|Mesh|Decal&keyword=...
+// Pesquisa no marketplace e devolve { items: [{ Id, Title, Sub }] } (mesmo formato da busca de audio).
+// COLE em main.js, ANTES de require('./compress'). Nao precisa de API key.
+// ---------------------------------------------------------------------------
+const TOOLBOX_CATEGORY = { Model: 10, Mesh: 4, Decal: 13 }; // assetTypeId do toolbox-service
+
+app.get('/toolbox', async (req, res) => {
+	const category = TOOLBOX_CATEGORY[req.query.type];
+	if (!category) {
+		return res.status(400).json({ error: 'invalid type query param' });
+	}
+	const keyword = String(req.query.keyword || '').slice(0, 100);
+
+	try {
+		const listRes = await fetch(
+			`https://apis.roblox.com/toolbox-service/v1/marketplace/${category}?limit=30&keyword=${encodeURIComponent(keyword)}`
+		);
+		if (!listRes.ok) {
+			return res.status(502).json({ error: `toolbox search failed: ${listRes.status}` });
+		}
+		const ids = ((await listRes.json()).data || []).map((d) => d.id).filter((n) => Number.isInteger(n));
+		if (ids.length === 0) {
+			return res.json({ items: [] });
+		}
+
+		const names = new Map();
+		const detRes = await fetch(
+			`https://apis.roblox.com/toolbox-service/v1/items/details?assetIds=${ids.join(',')}`
+		);
+		if (detRes.ok) {
+			for (const d of (await detRes.json()).data || []) {
+				if (d.asset) names.set(d.asset.id, d.asset.name);
+			}
+		}
+
+		res.json({ items: ids.map((id) => ({ Id: id, Title: names.get(id) || `Asset ${id}`, Sub: '' })) });
+	} catch (e) {
+		res.status(502).json({ error: `upstream request failed: ${e.message}` });
+	}
+});
+
 require('./compress').register(app, express);
 require('./translate').register(app, express);
 require('./rig-catalog').register(app);
