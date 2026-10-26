@@ -233,7 +233,11 @@ TR.__index = function(p, k)
 		return #inst:GetChildren()
 	end
 	if k == "Translate" then
-		return function(_, v, space)
+		return function(_, a, b, c, d)
+			local v, space = a, b
+			if type(a) == "number" then
+				v, space = Vector3.new(a, b, c), d
+			end
 			local cf = getCF(inst)
 			if space == CS.Space.World then
 				setCF(inst, cf + v)
@@ -243,7 +247,11 @@ TR.__index = function(p, k)
 		end
 	end
 	if k == "Rotate" then
-		return function(_, e, space)
+		return function(_, a, b, c, d)
+			local e, space = a, b
+			if type(a) == "number" then
+				e, space = Vector3.new(a, b, c), d
+			end
 			local r = CFrame.fromEulerAnglesYXZ(math.rad(e.X), math.rad(e.Y), math.rad(e.Z))
 			local cf = getCF(inst)
 			if space == CS.Space.World then
