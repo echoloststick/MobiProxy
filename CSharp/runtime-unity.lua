@@ -691,13 +691,17 @@ end
 
 local runtimeWarned = {}
 
-local function guarded(label, fn, ...)
+local function guarded(label, owner, fn, ...)
 	local ok, err = pcall(fn, ...)
 	if not ok then
-		local key = label .. tostring(err)
+		local key = label .. tostring(type(err) == "table" and err.Message or err)
 		if not runtimeWarned[key] then
 			runtimeWarned[key] = true
-			warn(string.format("[CSharp] Runtime error in %s: %s", label, tostring(type(err) == "table" and err.Message or err)))
+			if CS.report then
+				CS.report(label, err, owner)
+			else
+				warn(string.format("[CSharp] Runtime error in %s: %s", label, tostring(type(err) == "table" and err.Message or err)))
+			end
 		end
 	end
 	return ok
@@ -710,7 +714,11 @@ local function runEnumerator(e, handle)
 	while not handle.cancelled do
 		local ok, y = coroutine.resume(co)
 		if not ok then
-			warn("[CSharp] Runtime error in coroutine: " .. tostring(type(y) == "table" and y.Message or y))
+			if CS.report then
+				CS.report("coroutine", y, handle.owner)
+			else
+				warn("[CSharp] Runtime error in coroutine: " .. tostring(type(y) == "table" and y.Message or y))
+			end
 			break
 		end
 		if coroutine.status(co) == "dead" then
@@ -743,11 +751,11 @@ local function runEnumerator(e, handle)
 	handle.done = true
 end
 
-function CS.startCoroutine(e)
+function CS.startCoroutine(e, owner)
 	if type(e) ~= "table" or not e.__enumerator then
 		return nil
 	end
-	local handle = { __coroutine = true, done = false, cancelled = false, source = e }
+	local handle = { __coroutine = true, done = false, cancelled = false, source = e, owner = owner }
 	task.spawn(runEnumerator, e, handle)
 	return handle
 end
@@ -761,7 +769,7 @@ CS.MonoBehaviour.__get.tag = function(self)
 end
 
 function CS.MonoBehaviour.StartCoroutine(self, e)
-	local h = CS.startCoroutine(e)
+	local h = CS.startCoroutine(e, self)
 	self.__co = self.__co or {}
 	table.insert(self.__co, h)
 	return h
@@ -782,7 +790,7 @@ end
 function CS.MonoBehaviour.Invoke(self, name, delay)
 	task.delay(delay, function()
 		if self.enabled ~= false and not self.__destroyed then
-			guarded(getmetatable(self).__name .. "." .. name, self[name], self)
+			guarded(getmetatable(self).__name .. "." .. name, self, self[name], self)
 		end
 	end)
 end
@@ -794,7 +802,7 @@ function CS.MonoBehaviour.InvokeRepeating(self, name, delay, rate)
 	task.delay(delay, function()
 		while self.__rep[name] == token and not self.__destroyed do
 			if self.enabled ~= false then
-				guarded(getmetatable(self).__name .. "." .. name, self[name], self)
+				guarded(getmetatable(self).__name .. "." .. name, self, self[name], self)
 			end
 			task.wait(rate)
 		end
@@ -828,7 +836,7 @@ end
 local function callLife(b, name, ...)
 	local f = b[name]
 	if f then
-		local ok = guarded(getmetatable(b).__name .. "." .. name, function(...)
+		local ok = guarded(getmetatable(b).__name .. "." .. name, b, function(...)
 			local r = f(b, ...)
 			if type(r) == "table" and r.__enumerator then
 				b:StartCoroutine(r)
@@ -873,6 +881,9 @@ local function hook(b, inst)
 		end
 	end
 	inst.Destroying:Connect(function()
+		if b.__stopped then
+			return
+		end
 		b.__destroyed = true
 		callLife(b, "OnDestroy")
 	end)
@@ -880,6 +891,7 @@ end
 
 function CS.attach(cls, inst)
 	local b = cls.new()
+	b.__run = CS.run
 	b.gameObject = CS.GO(inst)
 	b.transform = TRof(inst)
 	if b.enabled == nil then
@@ -897,7 +909,34 @@ function CS.attach(cls, inst)
 end
 
 function CS.start(cls)
-	return CS.attach(cls, script.Parent)
+	return CS.attach(cls, CS.host or script.Parent)
+end
+
+function CS.stop(run)
+	for i = #behaviours, 1, -1 do
+		local b = behaviours[i]
+		if b.__run == run then
+			if not b.__destroyed then
+				callLife(b, "OnDisable")
+				callLife(b, "OnDestroy")
+			end
+			b.__destroyed = true
+			b.__stopped = true
+			b.enabled = false
+			for _, h in ipairs(b.__co or {}) do
+				h.cancelled = true
+			end
+			b.__rep = {}
+			table.remove(behaviours, i)
+			for inst, list in pairs(byInstance) do
+				for j = #list, 1, -1 do
+					if list[j] == b then
+						table.remove(list, j)
+					end
+				end
+			end
+		end
+	end
 end
 
 local fixedAcc = 0

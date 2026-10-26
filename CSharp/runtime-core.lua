@@ -1,6 +1,14 @@
 local CS = {}
 CS.RET = {}
 
+function CS.out(kind, text)
+	if kind == "log" then
+		print(text)
+	else
+		warn(text)
+	end
+end
+
 local QueueMT = { kind = "queue" }
 local StackMT = { kind = "stack" }
 local SetMT = { kind = "set" }
@@ -82,7 +90,7 @@ function CS.Exception.ToString(self)
 	return self.__name_override or getmetatable(self).__name .. ": " .. tostring(self.Message)
 end
 
-for _, n in ipairs({ "ArgumentException", "ArgumentNullException", "InvalidOperationException", "NullReferenceException", "NotImplementedException", "ApplicationException" }) do
+for _, n in ipairs({ "ArgumentException", "ArgumentNullException", "InvalidOperationException", "NullReferenceException", "NotImplementedException", "ApplicationException", "InvalidCastException", "StackOverflowException", "MissingMemberException", "MissingMethodException", "UnauthorizedAccessException", "TimeoutException", "IndexOutOfRangeException", "KeyNotFoundException", "FormatException", "OverflowException", "DivideByZeroException", "OperationCanceledException", "RuntimeException" }) do
 	CS[n] = CS.class(n, CS.Exception)
 end
 
@@ -90,7 +98,14 @@ function CS.ex(err)
 	if type(err) == "table" and getmetatable(err) and CS.is(err, CS.Exception) then
 		return err
 	end
-	return CS.Exception.new(tostring(err))
+	if CS.translate then
+		return CS.translate(err)
+	end
+	local e = CS.Exception.new(tostring(err))
+	if CS.getLine then
+		e.__line, e.__ctx = CS.getLine()
+	end
+	return e
 end
 
 function CS.invoke(f, ...)

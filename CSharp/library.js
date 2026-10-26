@@ -18,7 +18,7 @@ const VALUE_TYPES = new Set([
 
 const LIB_TYPES = new Set([
 	'Exception', 'ArgumentException', 'ArgumentNullException', 'InvalidOperationException', 'NullReferenceException',
-	'NotImplementedException', 'WaitForSeconds', 'WaitForEndOfFrame', 'WaitForFixedUpdate', 'WaitUntil', 'WaitWhile',
+	'NotImplementedException', 'InvalidCastException', 'StackOverflowException', 'MissingMemberException', 'MissingMethodException', 'UnauthorizedAccessException', 'TimeoutException', 'IndexOutOfRangeException', 'KeyNotFoundException', 'FormatException', 'OverflowException', 'DivideByZeroException', 'OperationCanceledException', 'WaitForSeconds', 'WaitForEndOfFrame', 'WaitForFixedUpdate', 'WaitUntil', 'WaitWhile',
 	'Quaternion', 'Color', 'Stopwatch', 'StringBuilder', 'Event', 'Action',
 ]);
 

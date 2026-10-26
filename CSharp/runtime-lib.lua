@@ -225,7 +225,7 @@ end
 CS.Console = {}
 
 function CS.Console.WriteLine(x)
-	print(CS.m.ToString(x))
+	CS.out("log", CS.m.ToString(x))
 end
 
 CS.Console.Write = CS.Console.WriteLine
@@ -322,20 +322,20 @@ end
 CS.Debug = {}
 
 function CS.Debug.Log(x)
-	print(CS.m.ToString(x))
+	CS.out("log", CS.m.ToString(x))
 end
 
 function CS.Debug.LogWarning(x)
-	warn(CS.m.ToString(x))
+	CS.out("warn", CS.m.ToString(x))
 end
 
 function CS.Debug.LogError(x)
-	warn("[Error] " .. CS.m.ToString(x))
+	CS.out("error", CS.m.ToString(x))
 end
 
 function CS.Debug.Assert(cond, msg)
 	if not cond then
-		warn("[Assertion failed] " .. CS.m.ToString(msg))
+		CS.out("warn", "Assertion failed: " .. CS.m.ToString(msg))
 	end
 end
 
