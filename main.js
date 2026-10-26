@@ -63,6 +63,15 @@
 //                     /encode e GET /mobi/status, /blocks, /library, /runtime, /reflect/:class.
 //                     Tudo isolado em Mobi/engine.js (que le Mobi/language.js, Mobi/blocks.js e
 //                     Mobi/runtime.lua -- os 4 arquivos precisam ficar juntos na pasta Mobi/).
+//   /csharp/*      -> linguagem C# adaptada ao Roblox (pasta CSharp/). So e' tratado como C# o script que
+//                     comeca com "using Roblox;". A rota principal e POST /csharp/compile, que recebe
+//                     { source, options } e devolve { ok, partial, source, sourceMap, diagnostics, stoppedAt,
+//                     convertedLines, totalLines, stats } com o C# convertido em Luau. Se houver erro, o
+//                     Luau devolvido cobre o script ate a linha do erro (ok = false, partial = true) e
+//                     stoppedAt/diagnostics dizem onde parou. Tambem: POST /csharp/validate (sem source),
+//                     POST /csharp/detect e GET /csharp/status, /csharp/runtime[?format=module].
+//                     options.prelude: "embedded" (padrao) | "module" | "injected". A pasta CSharp/ tem
+//                     engine.js, parser*.js, gen-*.js, lexer.js, library.js e os runtime-*.lua juntos.
 //   POST /compress   -> recebe o corpo CRU (text/plain, ate 4 MB) e devolve o Brotli dele em
 //                     base64url (texto puro), ja verificado por ida e volta no proprio proxy.
 //   POST /decompress -> faz o caminho inverso: recebe o base64url e devolve os bytes originais.
@@ -627,6 +636,14 @@ try {
 	require('./Mobi/engine').register(app, express);
 } catch (e) {
 	console.error(`[SMFX Proxy] MOBI routes are unavailable: ${e.message}`);
+}
+
+// C# -> Luau. Mesmo esquema do MOBI: um Router proprio em /csharp; se a pasta CSharp/ faltar ou quebrar,
+// o proxy sobe do mesmo jeito e so as rotas /csharp/* ficam indisponiveis.
+try {
+	require('./CSharp/engine').register(app, express);
+} catch (e) {
+	console.error(`[SMFX Proxy] CSharp routes are unavailable: ${e.message}`);
 }
 
 const port = process.env.PORT || 8080;
