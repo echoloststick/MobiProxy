@@ -194,18 +194,18 @@ app.get('/get', async (req, res) => {
 const GAMES_PAGE_LIMIT = 50;
 const MAX_GAMES_PAGES = 10; // ate 500 jogos -- suficiente pra qualquer criador na pratica
 
-async function fetchUserGames(userId) {
+async function fetchGamesPaged(baseUrl, label) {
 	const games = [];
 	let cursor = '';
 	let page = 0;
 
 	do {
 		const cursorParam = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
-		const url = `https://games.roblox.com/v2/users/${userId}/games?limit=${GAMES_PAGE_LIMIT}&sortOrder=Asc${cursorParam}`;
+		const url = `${baseUrl}${cursorParam}`;
 		const upstream = await fetch(url);
 
 		if (!upstream.ok) {
-			console.warn(`[SMFX Proxy] fetchUserGames falhou pro userId ${userId}: ${upstream.status}`);
+			console.warn(`[SMFX Proxy] fetchGamesPaged falhou pro ${label}: ${upstream.status}`);
 			break;
 		}
 
@@ -222,6 +222,14 @@ async function fetchUserGames(userId) {
 	} while (cursor && page < MAX_GAMES_PAGES);
 
 	return games;
+}
+
+function fetchUserGames(userId) {
+	return fetchGamesPaged(`https://games.roblox.com/v2/users/${userId}/games?limit=${GAMES_PAGE_LIMIT}&sortOrder=Asc`, `userId ${userId}`);
+}
+
+function fetchGroupGames(groupId) {
+	return fetchGamesPaged(`https://games.roblox.com/v2/groups/${groupId}/games?accessFilter=2&limit=${GAMES_PAGE_LIMIT}&sortOrder=Asc`, `groupId ${groupId}`);
 }
 
 // Icone via rbxthumb://type=GameIcon, formato que o proprio engine resolve no client --
@@ -291,6 +299,24 @@ app.get('/playergames', async (req, res) => {
 		res.json({ games });
 	} catch (e) {
 		console.warn(`[SMFX Proxy] /playergames request falhou pro userId ${userId}:`, e.message);
+		res.status(502).json({ error: `upstream request failed: ${e.message}` });
+	}
+});
+
+app.get('/groupgames', async (req, res) => {
+	const groupId = req.query.groupId;
+	if (!groupId || !/^\d+$/.test(String(groupId))) {
+		return res.status(400).json({ error: 'missing or invalid groupId query param' });
+	}
+
+	try {
+		const games = await fetchGroupGames(groupId);
+		for (const game of games) {
+			game.icon = gameIconUri(game.id);
+		}
+		res.json({ games });
+	} catch (e) {
+		console.warn(`[SMFX Proxy] /groupgames request falhou pro groupId ${groupId}:`, e.message);
 		res.status(502).json({ error: `upstream request failed: ${e.message}` });
 	}
 });
