@@ -1,24 +1,11 @@
 // SMFX Publish Proxy (Node.js / Express)
 // Rotas:
-//   POST /publish  -> recebe { url, objects, defaults } em JSON, monta o place (RBXL binario; RBXLX como
-//                     fallback) e repassa pro Open Cloud
+//   POST /publish  -> recebe { url, objects, defaults } em JSON, monta o place (sempre RBXL binario) e repassa pro Open Cloud
 //   GET  /get      -> proxy generico de leitura (usado pra resolver universeId/rootPlaceId,
 //                     que o HttpService do jogo nao alcanca direto por serem dominios *.roblox.com)
 //   POST /colorize -> recebe { code } em JSON, devolve { colored } em RichText -- usado pelo
 //                     Script Editor pra colorir o codigo sem depender do autoformat de aspas
 //                     do teclado mobile (que atrapalha se a coloracao for gerada no Lua)
-//   POST /ai       -> recebe { prompt } (ja pronto, montado pelo Lua) + header x-api-key com
-//                     a key do Gemini (mandada pelo Script do SERVIDOR do jogo, nunca por um
-//                     LocalScript), repassa pro Gemini e devolve { response } ou { error}.
-//                     Opcionalmente aceita { model, link } no body (IA personalizada do player): link e'
-//                     um template com {model} e {api}, que o proxy preenche com o model do body e a key
-//                     do header x-api-key. Sem model/link, usa os padroes de ai.js.
-//                     Logica isolada em ai.js. O proxy nao guarda a key em lugar nenhum
-//                     (nem env var) -- so repassa e esquece, igual o x-api-key de /publish.
-//   POST /format   -> recebe { text } (a resposta CRUA da IA) e devolve { richtext }, o mesmo
-//                     texto convertido pra Roblox RichText (**negrito** -> <b>, blocos de
-//                     codigo ``` -> fonte Code + colorize se for Luau). Logica isolada em
-//                     format.js, reaproveitando o colorizeLua do colorize.js.
 //   GET  /games    -> lista os jogos PUBLICOS de um userId (games.roblox.com/v2/users/{id}/games).
 //                     E' um dominio *.roblox.com, entao o HttpService do jogo nao alcanca direto --
 //                     por isso essa rota dedicada, em vez do /get generico (que exigiria montar a
@@ -54,7 +41,7 @@
 //                     Pra formato XML (.rbxmx) E BINARIO (.rbxm): devolve a ARVORE COMPLETA
 //                     (classe, propriedades, referencias entre instancias, filhos) -- o
 //                     ToolboxHandler reconstroi ela via Instance.new puro, sem InsertService.
-//                     A montagem do XML de saida vive em rbxlx-builder.js; os dois parsers de
+//                     Os dois parsers de
 //                     leitura (RBXMX e RBXM) vivem juntos em asset-parsers.js.
 //   /mobi/*        -> linguagem de blocos MOBI (pasta Mobi/). A rota principal e
 //                     POST /mobi/compile, que recebe { program | parts | encoded, options } e
@@ -89,10 +76,7 @@
 
 const express = require('express');
 const zlib = require('zlib');
-const { colorizeLua, colorizeWithErrors } = require('./colorize');
-const { askGemini, MAX_PROMPT_LENGTH: MAX_AI_PROMPT_LENGTH } = require('./ai');
-const { formatAIText } = require('./format');
-const { buildRBXLX } = require('./rbxlx-builder');
+const { colorizeWithErrors } = require('./colorize');
 const { buildRBXL } = require('./rbxl-builder');
 const { extractAssetTreesFromXML, extractAssetTreesFromBinary } = require('./asset-parsers');
 
@@ -120,26 +104,15 @@ app.post('/publish', async (req, res) => {
 		return res.status(400).json({ error: 'missing objects or url in JSON body' });
 	}
 
-	// Binary .rbxl is the default; SMFX_PUBLISH_FORMAT=xml (or payload.format = 'xml') forces RBXLX.
-	// If the binary build throws, the same objects are published as RBXLX instead.
+	// Always binary .rbxl (much smaller than RBXLX).
 	let fileBody;
-	let contentType;
-	if (process.env.SMFX_PUBLISH_FORMAT !== 'xml' && payload.format !== 'xml') {
-		try {
-			fileBody = buildRBXL(payload.objects, payload.defaults).buffer;
-			contentType = 'application/octet-stream';
-		} catch (e) {
-			console.error(`[SMFX Proxy] Binary place build failed, falling back to RBXLX: ${e.message}`);
-		}
+	try {
+		fileBody = buildRBXL(payload.objects, payload.defaults).buffer;
+	} catch (e) {
+		console.error(`[SMFX Proxy] Binary place build failed: ${e.message}`);
+		return res.status(500).json({ error: `failed to build the place file: ${e.message}` });
 	}
-	if (!fileBody) {
-		try {
-			fileBody = buildRBXLX(payload.objects);
-			contentType = 'application/xml';
-		} catch (e) {
-			return res.status(500).json({ error: `failed to build the place file: ${e.message}` });
-		}
-	}
+	const contentType = 'application/octet-stream';
 
 	const apiKey = req.headers['x-api-key'];
 	if (!apiKey) {
@@ -168,6 +141,12 @@ app.get('/get', async (req, res) => {
 	const url = req.query.url;
 	if (!url) {
 		return res.status(400).json({ error: 'missing url query param' });
+	}
+
+	let host = '';
+	try { host = new URL(url).hostname; } catch (e) { /* invalid url */ }
+	if (host !== 'roblox.com' && !host.endsWith('.roblox.com')) {
+		return res.status(403).json({ error: 'host not allowed' });
 	}
 
 	const headers = {};
@@ -342,66 +321,6 @@ app.post('/colorize', (req, res) => {
 	}
 });
 
-// AI Assistant -- recebe um prompt JA PRONTO (montado pelo servidor Lua,
-// com todo o contexto necessario: script atual, erro, pergunta do player,
-// etc) e repassa pro Gemini. O proxy so faz a ponte + trata erro; a logica
-// de "o que perguntar" fica inteira do lado do jogo. A API key vem no
-// header x-api-key -- mandada por um Script do SERVIDOR do jogo (nunca um
-// LocalScript, que qualquer explorer consegue abrir). O proxy nao guarda
-// essa key em lugar nenhum, nem env var: so repassa pro Gemini e esquece.
-app.post('/ai', async (req, res) => {
-	const { prompt, selection, model, link, temperature, maxOutputTokens, systemInstruction } = req.body || {};
-	if (typeof prompt !== 'string' || prompt.trim() === '') {
-		return res.status(400).json({ error: "campo 'prompt' obrigatorio" });
-	}
-	if (prompt.length > MAX_AI_PROMPT_LENGTH) {
-		return res.status(400).json({ error: `prompt excede o limite de ${MAX_AI_PROMPT_LENGTH} caracteres` });
-	}
-
-	const apiKey = req.headers['x-api-key'];
-	if (!apiKey) {
-		return res.status(400).json({ error: 'missing x-api-key header' });
-	}
-
-	try {
-		const { text, commands, finishReason } = await askGemini(prompt, apiKey, {
-			model,
-			link,
-			temperature,
-			maxOutputTokens,
-			systemInstruction,
-			selection,
-		});
-		res.json({ response: text, commands, finishReason });
-	} catch (e) {
-		console.warn('[SMFX Proxy] /ai falhou:', e.message);
-		res.status(e.statusCode || 502).json({ error: e.message });
-	}
-});
-
-const MAX_FORMAT_TEXT_LENGTH = 20000;
-
-// Formatação da resposta da IA (markdown -> Roblox RichText). Chamado pelo
-// Lua só DEPOIS que o client termina a animação de "digitando" -- não faz
-// sentido gastar processamento formatando um texto que ainda vai mudar de
-// tamanho na tela a cada frame da animação.
-app.post('/format', (req, res) => {
-	const { text } = req.body || {};
-	if (typeof text !== 'string' || text === '') {
-		return res.status(400).json({ error: "campo 'text' obrigatorio" });
-	}
-	if (text.length > MAX_FORMAT_TEXT_LENGTH) {
-		return res.status(400).json({ error: `text excede o limite de ${MAX_FORMAT_TEXT_LENGTH} caracteres` });
-	}
-
-	try {
-		res.json({ richtext: formatAIText(text) });
-	} catch (e) {
-		console.warn('[SMFX Proxy] /format falhou:', e.message);
-		res.status(500).json({ error: `format failed: ${e.message}` });
-	}
-});
-
 // Normaliza o assetType que vem do Open Cloud (o nome/case exato do campo ja
 // mudou de versao pra versao da API) pro que o Lua espera.
 function normalizeAssetType(raw) {
@@ -527,128 +446,6 @@ app.get('/asset', async (req, res) => {
 		format, // 'xml' | 'binary' | null
 		trees, // [{ referent, className, properties, refs, source, children }]
 	});
-});
-
-// ---------------------------------------------------------------------------
-// GET /toolbox?type=Model|Mesh|Decal&keyword=...
-// Pesquisa no marketplace e devolve { items: [{ Id, Title, Sub }] } (mesmo formato da busca de audio).
-// COLE em main.js, ANTES de require('./compress'). Nao precisa de API key.
-// ---------------------------------------------------------------------------
-const TOOLBOX_CATEGORY = { Model: 10, Mesh: 40, Decal: 13 }; // assetTypeId do toolbox-service
-
-// Ids da categoria MeshPart sao assets-container: o id da mesh de verdade ('MeshId') fica dentro da
-// arvore do asset. Baixa o container (Asset Delivery autenticado, igual ao /asset) e le o MeshId.
-const meshIdCache = new Map(); // containerId -> { meshId, tex, sa } | null
-
-function propId(node, ...names) {
-	for (const n of names) {
-		const raw = node.properties && node.properties[n];
-		const m = raw != null && JSON.stringify(raw).match(/(\d{5,})/);
-		if (m) return Number(m[1]);
-	}
-	return null;
-}
-
-// Devolve { meshId, tex, sa } -- tex = TextureID, sa = mapas do SurfaceAppearance filho (se houver)
-function findMeshInfo(trees) {
-	for (const node of trees || []) {
-		if (String(node.className) === 'MeshPart') {
-			const meshId = propId(node, 'MeshId', 'MeshID');
-			if (meshId) {
-				const info = { meshId, tex: propId(node, 'TextureID', 'TextureId'), sa: null };
-				const sa = (node.children || []).find((c) => String(c.className) === 'SurfaceAppearance');
-				if (sa) {
-					info.sa = {
-						ColorMap: propId(sa, 'ColorMap'),
-						NormalMap: propId(sa, 'NormalMap'),
-						MetalnessMap: propId(sa, 'MetalnessMap'),
-						RoughnessMap: propId(sa, 'RoughnessMap'),
-					};
-				}
-				return info;
-			}
-		}
-		const inner = findMeshInfo(node.children);
-		if (inner) return inner;
-	}
-	return null;
-}
-
-async function resolveMeshId(id, apiKey) {
-	if (meshIdCache.has(id)) return meshIdCache.get(id);
-	let info = null;
-	try {
-		const locRes = await fetch(`https://apis.roblox.com/asset-delivery-api/v1/assetId/${id}`, {
-			headers: { 'x-api-key': apiKey },
-		});
-		if (locRes.ok) {
-			const loc = (await locRes.json()).location;
-			const fileRes = loc && (await fetch(loc));
-			if (fileRes && fileRes.ok) {
-				let raw = Buffer.from(await fileRes.arrayBuffer());
-				if (raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b) raw = zlib.gunzipSync(raw);
-				const head = raw.slice(0, 8).toString('latin1');
-				if (head === '<roblox!') info = findMeshInfo(extractAssetTreesFromBinary(raw));
-				else if (head.startsWith('<roblox')) info = findMeshInfo(extractAssetTreesFromXML(raw.toString('utf8')));
-			}
-		} else {
-			console.warn(`[SMFX Proxy] /toolbox mesh ${id}: asset-delivery ${locRes.status}`);
-		}
-	} catch (e) {
-		console.warn(`[SMFX Proxy] /toolbox mesh ${id} falhou:`, e.message);
-	}
-	meshIdCache.set(id, info);
-	return info;
-}
-
-app.get('/toolbox', async (req, res) => {
-	const category = TOOLBOX_CATEGORY[req.query.type];
-	if (!category) {
-		return res.status(400).json({ error: 'invalid type query param' });
-	}
-	const keyword = String(req.query.keyword || '').slice(0, 100);
-
-	try {
-		const listRes = await fetch(
-			`https://apis.roblox.com/toolbox-service/v1/marketplace/${category}?limit=30&keyword=${encodeURIComponent(keyword)}`
-		);
-		if (!listRes.ok) {
-			return res.status(502).json({ error: `toolbox search failed: ${listRes.status} ${(await listRes.text()).slice(0, 150)}` });
-		}
-		const ids = ((await listRes.json()).data || []).map((d) => d.id).filter((n) => Number.isInteger(n));
-		if (ids.length === 0) {
-			return res.json({ items: [] });
-		}
-
-		const names = new Map();
-		const detRes = await fetch(
-			`https://apis.roblox.com/toolbox-service/v1/items/details?assetIds=${ids.join(',')}`
-		);
-		if (detRes.ok) {
-			for (const d of (await detRes.json()).data || []) {
-				if (d.asset) names.set(d.asset.id, d.asset.name);
-			}
-		}
-
-		let items = ids.map((id) => ({ Id: id, Title: names.get(id) || `Asset ${id}`, Sub: '' }));
-
-		if (req.query.type === 'Mesh') {
-			// Id vira o id da mesh (o que o CreateMeshPartAsync aceita); Thumb mantem o id do container (miniatura)
-			const apiKey = req.headers['x-api-key'] || process.env.OPEN_CLOUD_API_KEY;
-			if (!apiKey) {
-				return res.status(500).json({ error: 'mesh search needs OPEN_CLOUD_API_KEY (legacy-assets:manage) on the proxy' });
-			}
-			const resolved = await Promise.all(items.slice(0, 20).map(async (it) => {
-				const info = await resolveMeshId(it.Id, apiKey);
-				return info ? { Id: info.meshId, Tex: info.tex, SA: info.sa, Thumb: it.Id, Title: it.Title, Sub: '' } : null;
-			}));
-			items = resolved.filter(Boolean);
-		}
-
-		res.json({ items });
-	} catch (e) {
-		res.status(502).json({ error: `upstream request failed: ${e.message}` });
-	}
 });
 
 require('./compress').register(app, express);
