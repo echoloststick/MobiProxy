@@ -1,82 +1,9 @@
-// SMFX Publish Proxy (Node.js / Express)
-// Rotas:
-//   POST /publish  -> recebe { url, objects, defaults } em JSON, monta o place (sempre RBXL binario) e repassa pro Open Cloud
-//   GET  /get      -> proxy generico de leitura (usado pra resolver universeId/rootPlaceId,
-//                     que o HttpService do jogo nao alcanca direto por serem dominios *.roblox.com)
-//   POST /colorize -> recebe { code } em JSON, devolve { colored } em RichText -- usado pelo
-//                     Script Editor pra colorir o codigo sem depender do autoformat de aspas
-//                     do teclado mobile (que atrapalha se a coloracao for gerada no Lua)
-//   GET  /games    -> lista os jogos PUBLICOS de um userId (games.roblox.com/v2/users/{id}/games).
-//                     E' um dominio *.roblox.com, entao o HttpService do jogo nao alcanca direto --
-//                     por isso essa rota dedicada, em vez do /get generico (que exigiria montar a
-//                     URL toda no Lua). Chamado sem cookie/API key de propósito: esse endpoint so
-//                     devolve jogo PUBLICO quando anonimo, que e exatamente o filtro que o SMFX quer
-//                     aqui (o seletor de jogos do Publish nao deveria listar universe privado que
-//                     ainda nem foi publicado como publico). Pagina automaticamente ate
-//                     MAX_GAMES_PAGES paginas de 50 e devolve so { id, name } por jogo -- o Lua so
-//                     precisa disso pra montar o seletor.
-//   GET  /gameinfo -> recebe universeId, devolve { name, icon, placeId } pra UM jogo. Usado pelo
-//                     PublishSystem logo apos publicar, pra disparar o BindableEvent SetGame com
-//                     dado de exibicao (o icone e' "rbxthumb://type=GameIcon&id=...", que o
-//                     proprio engine resolve no client -- nao precisa de chamada externa nenhuma).
-//   GET  /playergames -> mesma paginacao/filtro do /games, mas devolve { id, name, icon, placeId }
-//                     por jogo (icone no mesmo formato rbxthumb do /gameinfo acima). Usado pelo
-//                     RemoteFunction GetPlayerGames pra montar a aba "Meus Jogos" do player.
-//   GET  /asset    -> consulta um assetId via Open Cloud (metadata, opcional) + Asset Delivery
-//                     (conteudo bruto). A API key (x-api-key) vem do PLAYER, repassada pelo
-//                     Lua a partir do RemoteEvent que manda o id do asset -- se o player nao
-//                     mandar nenhuma, o asset e tratado como publico (so os endpoints anonimos
-//                     sao usados). Com key: primeiro tenta o endpoint AUTENTICADO
-//                     apis.roblox.com/asset-delivery-api/v1/assetId/{id} (precisa do escopo
-//                     "legacy-assets:manage" na key) -- isso sim autentica como o DONO da key,
-//                     entao se o player gerar a propria key pessoal com esse escopo, o Open
-//                     Cloud te trata como aquele player de verdade e libera asset PRIVADO dele.
-//                     Sem key, o proxy nao consegue baixar conteudo NENHUM -- a Roblox passou
-//                     a exigir autenticacao no assetdelivery.roblox.com legado desde 02/04/2025
-//                     (antes disso era anonimo; hoje devolve 401 pra QUALQUER asset, publico ou
-//                     nao, sem cookie/key). Ou seja: API key deixou de ser so pra asset
-//                     privado -- hoje e obrigatoria pra importar qualquer Model pelo proxy,
-//                     ponto final. O fallback abaixo pro endpoint legado sem key fica so por
-//                     seguranca (sempre vai falhar com 401 na pratica, mas nao trava nada).
-//                     Pra formato XML (.rbxmx) E BINARIO (.rbxm): devolve a ARVORE COMPLETA
-//                     (classe, propriedades, referencias entre instancias, filhos) -- o
-//                     ToolboxHandler reconstroi ela via Instance.new puro, sem InsertService.
-//                     Os dois parsers de
-//                     leitura (RBXMX e RBXM) vivem juntos em asset-parsers.js.
-//   /mobi/*        -> linguagem de blocos MOBI (pasta Mobi/). A rota principal e
-//                     POST /mobi/compile, que recebe { program | parts | encoded, options } e
-//                     devolve { ok, source, sourceMap, diagnostics, skippedRoots, stats } com o
-//                     programa MOBI convertido em Luau. Tambem: POST /mobi/validate, /decode,
-//                     /encode e GET /mobi/status, /blocks, /library, /runtime, /reflect/:class.
-//                     Tudo isolado em Mobi/engine.js (que le Mobi/language.js, Mobi/blocks.js e
-//                     Mobi/runtime.lua -- os 4 arquivos precisam ficar juntos na pasta Mobi/).
-//   /csharp/*      -> linguagem C# adaptada ao Roblox (pasta CSharp/). So e' tratado como C# o script que
-//                     comeca com "using Roblox;". A rota principal e POST /csharp/compile, que recebe
-//                     { source, options } e devolve { ok, partial, source, sourceMap, diagnostics, stoppedAt,
-//                     convertedLines, totalLines, stats } com o C# convertido em Luau. Se houver erro, o
-//                     Luau devolvido cobre o script ate a linha do erro (ok = false, partial = true) e
-//                     stoppedAt/diagnostics dizem onde parou. Tambem: POST /csharp/validate (sem source),
-//                     POST /csharp/detect e GET /csharp/status, /csharp/runtime[?format=module].
-//                     options.prelude: "embedded" (padrao) | "module" | "injected". A pasta CSharp/ tem
-//                     engine.js, parser*.js, gen-*.js, lexer.js, library.js e os runtime-*.lua juntos.
-//   POST /compress   -> recebe o corpo CRU (text/plain, ate 4 MB) e devolve o Brotli dele em
-//                     base64url (texto puro), ja verificado por ida e volta no proprio proxy.
-//   POST /decompress -> faz o caminho inverso: recebe o base64url e devolve os bytes originais.
-//                     Usadas pelo SMFXSaveCodec pra guardar o JSON dos projetos comprimido no
-//                     DataStore (o Lua manda em pedacos de ~900 KB). Logica isolada em compress.js.
-//   POST /translate  -> recebe { texts: [..], target, source? } e devolve { ok, translations: [..] } na
-//                     mesma ordem ("" quando um item nao pode ser traduzido). Usada pelo TranslateServer
-//                     (Script do servidor do jogo) pra traduzir a interface do Studio Mobi. Protege tags
-//                     RichText, tem cache em memoria e usa GOOGLE_TRANSLATE_API_KEY se existir (senao o
-//                     endpoint web gratuito). Logica isolada em translate.js.
-//   GET  /rig/catalog -> busca acessorios no catalogo (catalog.roblox.com) por categoria do Avatar
-//                     Editor (Head, Hair, Face, Neck, Shoulder, Front, Back, Waist), com keyword e
-//                     cursor de paginacao. Devolve { ok, items: [{ id, name, price }], next }.
-//                     Logica isolada em rig-catalog.js.
+// SMFX Proxy (Node.js / Express)
+// Rotas: GET /health | POST /publish (monta RBXL binario e envia ao Open Cloud) | GET /get (leitura *.roblox.com)
+// GET /games, /playergames, /groupgames, /gameinfo | GET /asset | /compress, /decompress | /translate | /rig/catalog
 
 const express = require('express');
 const zlib = require('zlib');
-const { colorizeWithErrors } = require('./colorize');
 const { buildRBXL } = require('./rbxl-builder');
 const { extractAssetTreesFromXML, extractAssetTreesFromBinary } = require('./asset-parsers');
 
@@ -300,27 +227,6 @@ app.get('/groupgames', async (req, res) => {
 	}
 });
 
-// Colore codigo Luau em RichText, pro Script Editor, e devolve erro de sintaxe (bloco/bracket
-// nao fechado, string/comentario nao terminado). Fica no proxy (nao no Lua) por tres motivos: o
-// teclado mobile auto-formata aspas/etc quando o texto e montado direto no client, HttpService/
-// regex pesado em Lua e mais caro/limitado que fazer isso em JS, e o checker de sintaxe reusa o
-// mesmo tokenizer do colorize (nao faz sentido duplicar em Luau). "lines" vem pronto quebrado
-// por linha (cada uma com tags <font> balanceadas) pra dar pra re-renderizar so a linha com erro
-// sem precisar re-tokenizar/recolorir o script inteiro no client.
-app.post('/colorize', (req, res) => {
-	const { code } = req.body || {};
-	if (typeof code !== 'string') {
-		return res.status(400).json({ error: "campo 'code' obrigatorio" });
-	}
-
-	try {
-		const { colored, lines, errors } = colorizeWithErrors(code);
-		res.json({ colored, lines, errors });
-	} catch (e) {
-		res.status(500).json({ error: `colorize failed: ${e.message}` });
-	}
-});
-
 // Normaliza o assetType que vem do Open Cloud (o nome/case exato do campo ja
 // mudou de versao pra versao da API) pro que o Lua espera.
 function normalizeAssetType(raw) {
@@ -451,23 +357,6 @@ app.get('/asset', async (req, res) => {
 require('./compress').register(app, express);
 require('./translate').register(app, express);
 require('./rig-catalog').register(app);
-
-// MOBI -> Luau. O register() monta um Router proprio em /mobi (com o seu proprio parser JSON) e nao
-// mexe em nenhuma rota acima. Se a pasta Mobi/ estiver ausente ou quebrada, o proxy sobe do mesmo
-// jeito (publish, asset, AI etc continuam funcionando) e so as rotas /mobi/* ficam indisponiveis.
-try {
-	require('./Mobi/engine').register(app, express);
-} catch (e) {
-	console.error(`[SMFX Proxy] MOBI routes are unavailable: ${e.message}`);
-}
-
-// C# -> Luau. Mesmo esquema do MOBI: um Router proprio em /csharp; se a pasta CSharp/ faltar ou quebrar,
-// o proxy sobe do mesmo jeito e so as rotas /csharp/* ficam indisponiveis.
-try {
-	require('./CSharp/engine').register(app, express);
-} catch (e) {
-	console.error(`[SMFX Proxy] CSharp routes are unavailable: ${e.message}`);
-}
 
 const port = process.env.PORT || 8080;
 app.listen(port, '0.0.0.0', () => {
