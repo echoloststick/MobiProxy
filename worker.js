@@ -1,14 +1,20 @@
-// SMFX Proxy -- Cloudflare Worker entry (ES Module).
-// Render keeps running main.js (Express); Cloudflare runs this file (see wrangler.jsonc).
+// SMFX Proxy -- Cloudflare Worker entry (ES Module). Runs the whole proxy; no Render origin needed.
+// Render can keep running main.js (Express) in parallel; this file is what Cloudflare executes (see wrangler.jsonc).
 //
-// Handled here (light, no Node APIs): /health, /get, /games, /playergames, /groupgames, /gameinfo.
-// Forwarded to the Render origin (ORIGIN_URL): /publish, /asset, /compress, /decompress, /rig/catalog
-// and any other route. /asset responses are cached in KV (binding ASSET_CACHE) when available.
+// Routes: GET /health | GET /get | GET /games, /playergames, /groupgames, /gameinfo
+//         GET /asset (parsed with asset-parsers.js) | POST /publish (built with rbxl-builder.js)
+// Requires the "nodejs_compat" flag (Buffer / zlib used by the two shared modules).
+// Optional bindings: ASSET_CACHE (KV) caches /asset results; OPEN_CLOUD_API_KEY (secret) is the fallback
+// API key for /asset when the player does not send one.
+
+import { buildRBXL } from './rbxl-builder.js';
+import { extractAssetTreesFromXML, extractAssetTreesFromBinary } from './asset-parsers.js';
 
 const GAMES_PAGE_LIMIT = 50;
 const MAX_GAMES_PAGES = 10;
 const ASSET_CACHE_TTL_SECONDS = 60 * 60 * 24 * 7;
 const ASSET_CACHE_MAX_CHARS = 20 * 1024 * 1024;
+const PUBLISH_HOST = 'apis.roblox.com';
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
 	return new Response(JSON.stringify(data), {
@@ -24,6 +30,10 @@ function isPositiveInteger(value) {
 function gameIconUri(universeId) {
 	return `rbxthumb://type=GameIcon&id=${universeId}&w=150&h=150`;
 }
+
+// ---------------------------------------------------------------------------
+// Games
+// ---------------------------------------------------------------------------
 
 async function fetchGamesPaged(baseUrl) {
 	const games = [];
@@ -127,51 +137,199 @@ async function handleGet(request, url) {
 	}
 }
 
-function forwardToOrigin(request, env) {
-	if (!env.ORIGIN_URL) {
-		return jsonResponse({ error: 'ORIGIN_URL is not configured' }, 500);
+// ---------------------------------------------------------------------------
+// Asset (Toolbox importer)
+// ---------------------------------------------------------------------------
+
+function normalizeAssetType(raw) {
+	if (!raw) return null;
+	const s = String(raw).toLowerCase();
+	if (s.includes('decal') || s.includes('image')) return 'Decal';
+	if (s.includes('model') || s.includes('meshpart')) return 'Model';
+	return String(raw);
+}
+
+async function gunzip(bytes) {
+	const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+	return Buffer.from(await new Response(stream).arrayBuffer());
+}
+
+async function fetchAssetMetadata(id, apiKey) {
+	try {
+		const res = await fetch(`https://apis.roblox.com/assets/v1/assets/${id}`, { headers: { 'x-api-key': apiKey } });
+		if (res.ok) return await res.json();
+		console.warn(`[SMFX Proxy] Asset metadata request failed for id ${id}: HTTP ${res.status}`);
+	} catch (e) {
+		console.warn(`[SMFX Proxy] Asset metadata request error for id ${id}: ${e.message}`);
 	}
-	const source = new URL(request.url);
-	const target = new URL(source.pathname + source.search, env.ORIGIN_URL);
-	return fetch(new Request(target, request));
+	return null;
+}
+
+async function downloadAssetBytes(id, apiKey) {
+	if (apiKey) {
+		try {
+			const locRes = await fetch(`https://apis.roblox.com/asset-delivery-api/v1/assetId/${id}`, {
+				headers: { 'x-api-key': apiKey },
+			});
+			if (locRes.ok) {
+				const locData = await locRes.json();
+				if (locData.location) {
+					const fileRes = await fetch(locData.location);
+					if (fileRes.ok) {
+						let raw = Buffer.from(await fileRes.arrayBuffer());
+						// The CDN sometimes sends a gzip body without the Content-Encoding header.
+						if (raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b) {
+							try { raw = await gunzip(raw); } catch (e) { /* keep the raw bytes */ }
+						}
+						return raw;
+					}
+				}
+			} else {
+				console.warn(`[SMFX Proxy] Asset delivery request failed for id ${id}: HTTP ${locRes.status}`);
+			}
+		} catch (e) {
+			console.warn(`[SMFX Proxy] Asset delivery request error for id ${id}: ${e.message}`);
+		}
+	} else {
+		console.warn(`[SMFX Proxy] Asset ${id}: no API key received; Roblox requires authentication to download asset content.`);
+	}
+
+	// Legacy anonymous endpoint: kept in case Roblox reverts the authentication requirement.
+	try {
+		const res = await fetch(`https://assetdelivery.roblox.com/v1/asset/?id=${id}`);
+		if (res.ok) return Buffer.from(await res.arrayBuffer());
+		console.warn(`[SMFX Proxy] Legacy asset download failed for id ${id}: HTTP ${res.status}`);
+	} catch (e) {
+		console.warn(`[SMFX Proxy] Legacy asset download error for id ${id}: ${e.message}`);
+	}
+	return null;
+}
+
+async function loadAsset(id, apiKey) {
+	const meta = apiKey ? await fetchAssetMetadata(id, apiKey) : null;
+	const buf = await downloadAssetBytes(id, apiKey);
+
+	let format = null;
+	let trees = [];
+	const hasContent = Boolean(buf && buf.length > 0);
+
+	if (hasContent) {
+		const head = buf.subarray(0, 8).toString('latin1');
+		try {
+			if (head === '<roblox!') {
+				format = 'binary';
+				trees = extractAssetTreesFromBinary(buf);
+			} else if (head.startsWith('<roblox')) {
+				format = 'xml';
+				trees = extractAssetTreesFromXML(buf.toString('utf8'));
+			}
+		} catch (e) {
+			console.warn(`[SMFX Proxy] Asset ${id} could not be parsed: ${e.message}`);
+			trees = [];
+		}
+	}
+
+	return {
+		assetType: normalizeAssetType(meta && (meta.assetType || meta.AssetType)),
+		displayName: (meta && (meta.displayName || meta.name)) || null,
+		hasContent,
+		format,
+		trees,
+	};
 }
 
 async function handleAsset(request, env, ctx, url) {
 	const id = url.searchParams.get('id');
-	if (!id) return jsonResponse({ error: 'missing id query parameter' }, 400);
+	if (!isPositiveInteger(id)) return jsonResponse({ error: 'missing or invalid id query parameter' }, 400);
 
-	// Requests carrying a player API key may return private assets: never cache or serve those from cache.
-	const cacheable = Boolean(env.ASSET_CACHE) && !request.headers.get('x-api-key');
+	const playerKey = request.headers.get('x-api-key');
+
+	// Results fetched with a player key may be private assets: never cache or serve those from cache.
+	const cacheable = Boolean(env.ASSET_CACHE) && !playerKey;
 	const cacheKey = `asset:${id}`;
 
 	if (cacheable) {
 		try {
 			const hit = await env.ASSET_CACHE.get(cacheKey, 'stream');
 			if (hit) {
-				return new Response(hit, {
-					headers: { 'Content-Type': 'application/json', 'X-Mobi-Cache': 'HIT' },
-				});
+				return new Response(hit, { headers: { 'Content-Type': 'application/json', 'X-Mobi-Cache': 'HIT' } });
 			}
 		} catch (e) {
-			// Cache read failed: fall through to the origin.
+			// Cache read failed: load the asset normally.
 		}
 	}
 
-	const response = await forwardToOrigin(request, env);
-	if (!cacheable || !response.ok) return response;
-
-	const body = await response.text();
-	if (body.length <= ASSET_CACHE_MAX_CHARS && body.includes('"hasContent":true')) {
-		ctx.waitUntil(
-			env.ASSET_CACHE.put(cacheKey, body, { expirationTtl: ASSET_CACHE_TTL_SECONDS }).catch(() => {})
-		);
+	let result;
+	try {
+		result = await loadAsset(id, playerKey || env.OPEN_CLOUD_API_KEY || null);
+	} catch (e) {
+		return jsonResponse({ error: `asset processing failed: ${e.message}` }, 500);
 	}
 
-	return new Response(body, {
-		status: response.status,
-		headers: { 'Content-Type': 'application/json', 'X-Mobi-Cache': 'MISS' },
-	});
+	const body = JSON.stringify(result);
+	if (cacheable && result.hasContent && body.length <= ASSET_CACHE_MAX_CHARS) {
+		ctx.waitUntil(env.ASSET_CACHE.put(cacheKey, body, { expirationTtl: ASSET_CACHE_TTL_SECONDS }).catch(() => {}));
+	}
+
+	return new Response(body, { headers: { 'Content-Type': 'application/json', 'X-Mobi-Cache': cacheable ? 'MISS' : 'BYPASS' } });
 }
+
+// ---------------------------------------------------------------------------
+// Publish (builds the binary place file and uploads it through Open Cloud)
+// ---------------------------------------------------------------------------
+
+async function handlePublish(request) {
+	let payload;
+	try {
+		payload = await request.json();
+	} catch (e) {
+		return jsonResponse({ error: 'invalid JSON body' }, 400);
+	}
+	if (!payload || !payload.objects || !payload.url) {
+		return jsonResponse({ error: 'missing objects or url in JSON body' }, 400);
+	}
+
+	const apiKey = request.headers.get('x-api-key');
+	if (!apiKey) return jsonResponse({ error: 'missing x-api-key header' }, 400);
+
+	let publishUrl;
+	try {
+		publishUrl = new URL(payload.url);
+	} catch (e) {
+		return jsonResponse({ error: 'invalid upload url' }, 400);
+	}
+	if (publishUrl.protocol !== 'https:' || publishUrl.hostname !== PUBLISH_HOST) {
+		return jsonResponse({ error: 'upload host not allowed' }, 403);
+	}
+
+	let fileBody;
+	try {
+		const built = buildRBXL(payload.objects, payload.defaults).buffer;
+		fileBody = new Uint8Array(built.buffer, built.byteOffset, built.byteLength);
+	} catch (e) {
+		console.error(`[SMFX Proxy] Binary place build failed: ${e.message}`);
+		return jsonResponse({ error: `failed to build the place file: ${e.message}` }, 500);
+	}
+
+	try {
+		const upstream = await fetch(publishUrl.toString(), {
+			method: 'POST',
+			headers: { 'x-api-key': apiKey, 'Content-Type': 'application/octet-stream' },
+			body: fileBody,
+		});
+		const body = await upstream.text();
+		return new Response(body, {
+			status: upstream.status,
+			headers: { 'Content-Type': upstream.headers.get('content-type') || 'application/json' },
+		});
+	} catch (e) {
+		return jsonResponse({ error: `upstream request failed: ${e.message}` }, 502);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
 
 export default {
 	async fetch(request, env, ctx) {
@@ -187,7 +345,8 @@ export default {
 			if (path === '/gameinfo') return handleGameInfo(url);
 			if (path === '/asset') return handleAsset(request, env, ctx, url);
 		}
+		if (request.method === 'POST' && path === '/publish') return handlePublish(request);
 
-		return forwardToOrigin(request, env);
+		return jsonResponse({ error: 'not found' }, 404);
 	},
 };
