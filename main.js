@@ -1,6 +1,6 @@
 // SMFX Proxy (Node.js / Express)
 // Rotas: GET /health | POST /publish (monta RBXL binario e envia ao Open Cloud) | GET /get (leitura *.roblox.com)
-// GET /games, /playergames, /groupgames, /gameinfo | GET /asset | /compress, /decompress | /translate | /rig/catalog
+// GET /games, /playergames, /groupgames, /gameinfo | GET /asset | /compress, /decompress | /rig/catalog | GET /stats (bytes por rota)
 
 const express = require('express');
 const zlib = require('zlib');
@@ -8,6 +8,8 @@ const { buildRBXL } = require('./rbxl-builder');
 const { extractAssetTreesFromXML, extractAssetTreesFromBinary } = require('./asset-parsers');
 
 const app = express();
+
+require('./metrics').register(app); // contador de bytes por rota (GET /stats)
 
 app.use(express.json({ limit: '50mb' })); // projeto grande gera JSON grande
 
@@ -355,7 +357,6 @@ app.get('/asset', async (req, res) => {
 });
 
 require('./compress').register(app, express);
-require('./translate').register(app, express);
 require('./rig-catalog').register(app);
 
 const port = process.env.PORT || 8080;
