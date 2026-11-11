@@ -15,6 +15,9 @@ const MAX_GAMES_PAGES = 10;
 const ASSET_CACHE_TTL_SECONDS = 60 * 60 * 24 * 7;
 const ASSET_CACHE_MAX_CHARS = 20 * 1024 * 1024;
 const PUBLISH_HOST = 'apis.roblox.com';
+const GAMES_CACHE_TTL_SECONDS = 60;
+const GAME_INFO_CACHE_TTL_SECONDS = 300;
+const GET_CACHE_TTL_SECONDS = 600;
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
 	return new Response(JSON.stringify(data), {
@@ -32,6 +35,71 @@ function gameIconUri(universeId) {
 }
 
 // ---------------------------------------------------------------------------
+// Roblox requests: retry on rate limits (HTTP 429) and short-lived in-memory cache
+// ---------------------------------------------------------------------------
+// Roblox rate-limits per IP address and Cloudflare Workers share egress IPs, so 429 responses are
+// common. Requests are retried with a short backoff, and successful anonymous responses are kept in
+// memory for a few minutes (per isolate) so repeated lookups do not hit Roblox again.
+
+const RETRY_DELAYS_MS = [300, 800, 1600];
+const MAX_RETRY_AFTER_MS = 2500;
+const MEMORY_CACHE_MAX_ENTRIES = 200;
+const memoryCache = new Map();
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url, init) {
+	for (let attempt = 0; ; attempt++) {
+		const response = await fetch(url, init);
+		if (response.status !== 429 || attempt >= RETRY_DELAYS_MS.length) return response;
+
+		const retryAfter = Number(response.headers.get('retry-after'));
+		const waitMs =
+			Number.isFinite(retryAfter) && retryAfter > 0
+				? Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS)
+				: RETRY_DELAYS_MS[attempt];
+		try {
+			await response.body?.cancel();
+		} catch (e) {
+			// Body already consumed or closed.
+		}
+		await sleep(waitMs + Math.random() * 150);
+	}
+}
+
+// Returns { status, ok, contentType, body } with the body already read as text.
+// Responses are cached only for anonymous requests (no API key) that succeeded.
+async function robloxGet(target, { headers = {}, ttlSeconds = 0 } = {}) {
+	const cacheable = ttlSeconds > 0 && Object.keys(headers).length === 0;
+
+	if (cacheable) {
+		const hit = memoryCache.get(target);
+		if (hit && hit.expires > Date.now()) return hit.value;
+		if (hit) memoryCache.delete(target);
+	}
+
+	const upstream = await fetchWithRetry(target, { method: 'GET', headers });
+	const value = {
+		status: upstream.status,
+		ok: upstream.ok,
+		contentType: upstream.headers.get('content-type') || 'application/json',
+		body: await upstream.text(),
+	};
+
+	if (cacheable && value.ok) {
+		if (memoryCache.size >= MEMORY_CACHE_MAX_ENTRIES) memoryCache.delete(memoryCache.keys().next().value);
+		memoryCache.set(target, { value, expires: Date.now() + ttlSeconds * 1000 });
+	}
+	return value;
+}
+
+function rateLimitedResponse() {
+	return jsonResponse({ error: 'Roblox rate limit reached (HTTP 429). Please try again in a few seconds.' }, 429);
+}
+
+// ---------------------------------------------------------------------------
 // Games
 // ---------------------------------------------------------------------------
 
@@ -42,10 +110,10 @@ async function fetchGamesPaged(baseUrl) {
 
 	do {
 		const cursorParam = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
-		const upstream = await fetch(`${baseUrl}${cursorParam}`);
+		const upstream = await robloxGet(`${baseUrl}${cursorParam}`, { ttlSeconds: GAMES_CACHE_TTL_SECONDS });
 		if (!upstream.ok) break;
 
-		const body = await upstream.json();
+		const body = JSON.parse(upstream.body);
 		for (const item of body.data || []) {
 			if (item && item.id != null) {
 				const placeId = item.rootPlace && item.rootPlace.id != null ? item.rootPlace.id : null;
@@ -94,9 +162,11 @@ async function handleGameInfo(url) {
 	let name = null;
 	let placeId = null;
 	try {
-		const upstream = await fetch(`https://games.roblox.com/v1/games?universeIds=${universeId}`);
+		const upstream = await robloxGet(`https://games.roblox.com/v1/games?universeIds=${universeId}`, {
+			ttlSeconds: GAME_INFO_CACHE_TTL_SECONDS,
+		});
 		if (upstream.ok) {
-			const body = await upstream.json();
+			const body = JSON.parse(upstream.body);
 			const entry = body.data && body.data[0];
 			name = (entry && entry.name) || null;
 			placeId = (entry && entry.rootPlaceId) || null;
@@ -127,10 +197,12 @@ async function handleGet(request, url) {
 	if (apiKey) headers['x-api-key'] = apiKey;
 
 	try {
-		const upstream = await fetch(target, { method: 'GET', headers });
+		// Requests with an API key are never cached (the answer may depend on the key owner).
+		const upstream = await robloxGet(target, { headers, ttlSeconds: GET_CACHE_TTL_SECONDS });
+		if (upstream.status === 429) return rateLimitedResponse();
 		return new Response(upstream.body, {
 			status: upstream.status,
-			headers: { 'Content-Type': upstream.headers.get('content-type') || 'application/json' },
+			headers: { 'Content-Type': upstream.contentType },
 		});
 	} catch (e) {
 		return jsonResponse({ error: `upstream request failed: ${e.message}` }, 502);
@@ -156,7 +228,7 @@ async function gunzip(bytes) {
 
 async function fetchAssetMetadata(id, apiKey) {
 	try {
-		const res = await fetch(`https://apis.roblox.com/assets/v1/assets/${id}`, { headers: { 'x-api-key': apiKey } });
+		const res = await fetchWithRetry(`https://apis.roblox.com/assets/v1/assets/${id}`, { headers: { 'x-api-key': apiKey } });
 		if (res.ok) return await res.json();
 		console.warn(`[SMFX Proxy] Asset metadata request failed for id ${id}: HTTP ${res.status}`);
 	} catch (e) {
@@ -168,7 +240,7 @@ async function fetchAssetMetadata(id, apiKey) {
 async function downloadAssetBytes(id, apiKey) {
 	if (apiKey) {
 		try {
-			const locRes = await fetch(`https://apis.roblox.com/asset-delivery-api/v1/assetId/${id}`, {
+			const locRes = await fetchWithRetry(`https://apis.roblox.com/asset-delivery-api/v1/assetId/${id}`, {
 				headers: { 'x-api-key': apiKey },
 			});
 			if (locRes.ok) {
