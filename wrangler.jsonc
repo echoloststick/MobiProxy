@@ -6,6 +6,9 @@
 	"compatibility_flags": ["nodejs_compat"],
 	"workers_dev": true,
 	"preview_urls": false
+    "vars": {
+		"ORIGIN_URL": "https://mobiproxy.onrender.com"
+	}
 	// Optional: cache /asset results. Create a KV namespace (Cloudflare dashboard > Storage & Databases > KV),
 	// then uncomment this line and paste its id:
 	// ,"kv_namespaces": [{ "binding": "ASSET_CACHE", "id": "PASTE_KV_NAMESPACE_ID_HERE" }]
