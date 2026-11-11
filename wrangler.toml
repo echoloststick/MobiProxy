@@ -1,4 +1,12 @@
-name = "mobi-proxy"
-main = "main.js"
-compatibility_date = "2026-11-10"
-compatibility_flags = ["nodejs_compat"]
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "mobiproxy",
+	"main": "worker.js",
+	"compatibility_date": "2026-11-01",
+	"vars": {
+		"ORIGIN_URL": "https://mobiproxy.onrender.com"
+	}
+	// To cache /asset at the edge, create a KV namespace (Cloudflare dashboard > Storage & Databases > KV),
+	// then uncomment this block and paste its id:
+	// ,"kv_namespaces": [{ "binding": "ASSET_CACHE", "id": "PASTE_KV_NAMESPACE_ID_HERE" }]
+}
