@@ -376,7 +376,8 @@ async function handlePublish(request) {
 
 	let fileBody;
 	try {
-		const built = buildRBXL(payload.objects, payload.defaults).buffer;
+		// Uncompressed chunks: about 3x less CPU per build, and outbound traffic from Cloudflare is free.
+		const built = buildRBXL(payload.objects, payload.defaults, { compress: false }).buffer;
 		fileBody = new Uint8Array(built.buffer, built.byteOffset, built.byteLength);
 	} catch (e) {
 		console.error(`[SMFX Proxy] Binary place build failed: ${e.message}`);

@@ -438,12 +438,16 @@ function orderTree(roots) {
 // Chunks
 // ---------------------------------------------------------------------------
 
+// When false, chunks are written uncompressed (compressedLength 0, valid in the format). Skipping LZ4
+// roughly halves the CPU time of a build, which matters on hosts with a hard CPU limit per request.
+let compressChunks = true;
+
 function chunk(name, payload, compress = true) {
 	const header = Buffer.alloc(16);
 	header.write(name, 0, 'latin1');
 	let body = payload;
 	let compressedLength = 0;
-	if (compress && payload.length > 64) {
+	if (compress && compressChunks && payload.length > 64) {
 		const packed = lz4Compress(payload);
 		if (packed && packed.length < payload.length) {
 			body = packed;
@@ -497,7 +501,16 @@ function prepareObjects(objects, fillMissing) {
 	return result;
 }
 
-function buildRBXL(rawObjects, defaultsByClass) {
+function buildRBXL(rawObjects, defaultsByClass, options) {
+	compressChunks = !(options && options.compress === false);
+	try {
+		return buildRBXLInner(rawObjects, defaultsByClass);
+	} finally {
+		compressChunks = true;
+	}
+}
+
+function buildRBXLInner(rawObjects, defaultsByClass) {
 	const objects = prepareObjects(rawObjects, true);
 	const defaults = defaultsByClass && typeof defaultsByClass === 'object' ? defaultsByClass : {};
 	const warnings = [];
