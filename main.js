@@ -1,6 +1,6 @@
 // SMFX Proxy (Node.js / Express)
 // Rotas: GET /health | POST /publish (monta RBXL binario e envia ao Open Cloud) | GET /get (leitura *.roblox.com)
-// GET /games, /playergames, /groupgames, /gameinfo | GET /asset | /compress, /decompress | /rig/catalog | GET /stats (bytes por rota)
+// POST /publishmodel (sobe FBX/GLB/GLTF/RBXM/RBXMX ao Open Cloud) | GET /games, /playergames, /groupgames, /gameinfo | GET /asset | /compress, /decompress | /rig/catalog | GET /stats (bytes por rota)
 
 const express = require('express');
 const zlib = require('zlib');
@@ -387,6 +387,7 @@ app.get('/asset', async (req, res) => {
 });
 
 require('./compress').register(app, express);
+require('./model-publish').register(app, express);
 require('./rig-catalog').register(app);
 
 const port = process.env.PORT || 8080;
