@@ -350,42 +350,73 @@ async function handleAsset(request, env, ctx, url) {
 // Publish (builds the binary place file and uploads it through Open Cloud)
 // ---------------------------------------------------------------------------
 
-async function handlePublish(request) {
-	let payload;
-	try {
-		payload = await request.json();
-	} catch (e) {
-		return jsonResponse({ error: 'invalid JSON body' }, 400);
-	}
-	if (!payload || !payload.objects || !payload.url) {
-		return jsonResponse({ error: 'missing objects or url in JSON body' }, 400);
-	}
+const RBXL_MAGIC = '<roblox!';
 
+function validatePublishUrl(rawUrl) {
+	let publishUrl;
+	try {
+		publishUrl = new URL(rawUrl);
+	} catch (e) {
+		return { error: jsonResponse({ error: 'invalid upload url' }, 400) };
+	}
+	if (publishUrl.protocol !== 'https:' || publishUrl.hostname !== PUBLISH_HOST) {
+		return { error: jsonResponse({ error: 'upload host not allowed' }, 403) };
+	}
+	return { url: publishUrl };
+}
+
+// Two request shapes are accepted:
+//  1. Binary .rbxl built in-game: Content-Type application/octet-stream, the Open Cloud upload URL in the
+//     x-publish-url header (or the "url" query parameter). The file is forwarded as is.
+//  2. JSON { objects, defaults, url }: the place file is built here (fallback converter).
+async function handlePublish(request) {
 	const apiKey = request.headers.get('x-api-key');
 	if (!apiKey) return jsonResponse({ error: 'missing x-api-key header' }, 400);
 
-	let publishUrl;
-	try {
-		publishUrl = new URL(payload.url);
-	} catch (e) {
-		return jsonResponse({ error: 'invalid upload url' }, 400);
-	}
-	if (publishUrl.protocol !== 'https:' || publishUrl.hostname !== PUBLISH_HOST) {
-		return jsonResponse({ error: 'upload host not allowed' }, 403);
-	}
-
+	const isBinary = (request.headers.get('content-type') || '').toLowerCase().includes('application/octet-stream');
+	let target;
 	let fileBody;
-	try {
-		// Uncompressed chunks: about 3x less CPU per build, and outbound traffic from Cloudflare is free.
-		const built = buildRBXL(payload.objects, payload.defaults, { compress: false }).buffer;
-		fileBody = new Uint8Array(built.buffer, built.byteOffset, built.byteLength);
-	} catch (e) {
-		console.error(`[SMFX Proxy] Binary place build failed: ${e.message}`);
-		return jsonResponse({ error: `failed to build the place file: ${e.message}` }, 500);
+
+	if (isBinary) {
+		const rawUrl = request.headers.get('x-publish-url') || new URL(request.url).searchParams.get('url');
+		if (!rawUrl) return jsonResponse({ error: 'missing x-publish-url header' }, 400);
+
+		const checked = validatePublishUrl(rawUrl);
+		if (checked.error) return checked.error;
+		target = checked.url;
+
+		fileBody = new Uint8Array(await request.arrayBuffer());
+		const magic = new TextDecoder('latin1').decode(fileBody.subarray(0, RBXL_MAGIC.length));
+		if (magic !== RBXL_MAGIC) {
+			return jsonResponse({ error: 'request body is not a binary .rbxl file' }, 400);
+		}
+	} else {
+		let payload;
+		try {
+			payload = await request.json();
+		} catch (e) {
+			return jsonResponse({ error: 'invalid JSON body' }, 400);
+		}
+		if (!payload || !payload.objects || !payload.url) {
+			return jsonResponse({ error: 'missing objects or url in JSON body' }, 400);
+		}
+
+		const checked = validatePublishUrl(payload.url);
+		if (checked.error) return checked.error;
+		target = checked.url;
+
+		try {
+			// Uncompressed chunks: about 3x less CPU per build, and outbound traffic from Cloudflare is free.
+			const built = buildRBXL(payload.objects, payload.defaults, { compress: false }).buffer;
+			fileBody = new Uint8Array(built.buffer, built.byteOffset, built.byteLength);
+		} catch (e) {
+			console.error(`[SMFX Proxy] Binary place build failed: ${e.message}`);
+			return jsonResponse({ error: `failed to build the place file: ${e.message}` }, 500);
+		}
 	}
 
 	try {
-		const upstream = await fetch(publishUrl.toString(), {
+		const upstream = await fetch(target.toString(), {
 			method: 'POST',
 			headers: { 'x-api-key': apiKey, 'Content-Type': 'application/octet-stream' },
 			body: fileBody,

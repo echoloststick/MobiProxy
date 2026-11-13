@@ -27,31 +27,61 @@ app.get('/health', (req, res) => {
 	res.type('text/plain').send('ok');
 });
 
-app.post('/publish', async (req, res) => {
-	const payload = req.body;
-	if (!payload || !payload.objects || !payload.url) {
-		return res.status(400).json({ error: 'missing objects or url in JSON body' });
-	}
+// Aceita dois formatos:
+//  1. .rbxl binario ja montado no jogo (Content-Type application/octet-stream): a URL do Open Cloud vem no
+//     header x-publish-url e o arquivo e repassado sem alteracao.
+//  2. JSON { objects, defaults, url }: o proxy monta o .rbxl com o conversor (fallback).
+const PUBLISH_HOST = 'apis.roblox.com';
+const RBXL_MAGIC = '<roblox!';
 
-	// Always binary .rbxl (much smaller than RBXLX).
-	let fileBody;
-	try {
-		fileBody = buildRBXL(payload.objects, payload.defaults).buffer;
-	} catch (e) {
-		console.error(`[SMFX Proxy] Binary place build failed: ${e.message}`);
-		return res.status(500).json({ error: `failed to build the place file: ${e.message}` });
-	}
-	const contentType = 'application/octet-stream';
-
+app.post('/publish', express.raw({ type: 'application/octet-stream', limit: '50mb' }), async (req, res) => {
 	const apiKey = req.headers['x-api-key'];
 	if (!apiKey) {
 		return res.status(400).json({ error: 'missing x-api-key header' });
 	}
 
+	let rawUrl;
+	let fileBody;
+
+	if (Buffer.isBuffer(req.body)) {
+		rawUrl = req.headers['x-publish-url'] || req.query.url;
+		if (!rawUrl) {
+			return res.status(400).json({ error: 'missing x-publish-url header' });
+		}
+		if (req.body.subarray(0, RBXL_MAGIC.length).toString('latin1') !== RBXL_MAGIC) {
+			return res.status(400).json({ error: 'request body is not a binary .rbxl file' });
+		}
+		fileBody = req.body;
+	} else {
+		const payload = req.body;
+		if (!payload || !payload.objects || !payload.url) {
+			return res.status(400).json({ error: 'missing objects or url in JSON body' });
+		}
+		rawUrl = payload.url;
+
+		// Always binary .rbxl (much smaller than RBXLX).
+		try {
+			fileBody = buildRBXL(payload.objects, payload.defaults).buffer;
+		} catch (e) {
+			console.error(`[SMFX Proxy] Binary place build failed: ${e.message}`);
+			return res.status(500).json({ error: `failed to build the place file: ${e.message}` });
+		}
+	}
+
+	let publishUrl;
 	try {
-		const upstream = await fetch(payload.url, {
+		publishUrl = new URL(rawUrl);
+	} catch (e) {
+		return res.status(400).json({ error: 'invalid upload url' });
+	}
+	if (publishUrl.protocol !== 'https:' || publishUrl.hostname !== PUBLISH_HOST) {
+		return res.status(403).json({ error: 'upload host not allowed' });
+	}
+
+	try {
+		const upstream = await fetch(publishUrl.toString(), {
 			method: 'POST',
-			headers: { 'x-api-key': apiKey, 'Content-Type': contentType },
+			headers: { 'x-api-key': apiKey, 'Content-Type': 'application/octet-stream' },
 			body: fileBody,
 		});
 		const body = await upstream.text();
