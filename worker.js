@@ -3,14 +3,12 @@
 //
 // Routes: GET /health | GET /get | GET /games, /playergames, /groupgames, /gameinfo
 //         GET /asset (parsed with asset-parsers.js) | POST /publish (built with rbxl-builder.js)
-//         POST /publishmodel (model upload, see model-publish.js)
 // Requires the "nodejs_compat" flag (Buffer / zlib used by the two shared modules).
 // Optional bindings: ASSET_CACHE (KV) caches /asset results; OPEN_CLOUD_API_KEY (secret) is the fallback
 // API key for /asset when the player does not send one.
 
 import { buildRBXL } from './rbxl-builder.js';
 import { extractAssetTreesFromXML, extractAssetTreesFromBinary } from './asset-parsers.js';
-import { handleWorker as handlePublishModel } from './model-publish.js';
 
 const GAMES_PAGE_LIMIT = 50;
 const MAX_GAMES_PAGES = 10;
@@ -375,29 +373,27 @@ async function handlePublish(request) {
 	const apiKey = request.headers.get('x-api-key');
 	if (!apiKey) return jsonResponse({ error: 'missing x-api-key header' }, 400);
 
-	const isBinary = (request.headers.get('content-type') || '').toLowerCase().includes('application/octet-stream');
+	// The body is read once and recognized by its content (a binary place file starts with "<roblox!"), not by the
+	// Content-Type header, because HTTP clients can change that header.
+	const bytes = new Uint8Array(await request.arrayBuffer());
+	const isBinary = new TextDecoder('latin1').decode(bytes.subarray(0, RBXL_MAGIC.length)) === RBXL_MAGIC;
 	let target;
 	let fileBody;
 
 	if (isBinary) {
 		const rawUrl = request.headers.get('x-publish-url') || new URL(request.url).searchParams.get('url');
-		if (!rawUrl) return jsonResponse({ error: 'missing x-publish-url header' }, 400);
+		if (!rawUrl) return jsonResponse({ error: 'missing upload url (url query parameter)' }, 400);
 
 		const checked = validatePublishUrl(rawUrl);
 		if (checked.error) return checked.error;
 		target = checked.url;
-
-		fileBody = new Uint8Array(await request.arrayBuffer());
-		const magic = new TextDecoder('latin1').decode(fileBody.subarray(0, RBXL_MAGIC.length));
-		if (magic !== RBXL_MAGIC) {
-			return jsonResponse({ error: 'request body is not a binary .rbxl file' }, 400);
-		}
+		fileBody = bytes;
 	} else {
 		let payload;
 		try {
-			payload = await request.json();
+			payload = JSON.parse(new TextDecoder().decode(bytes));
 		} catch (e) {
-			return jsonResponse({ error: 'invalid JSON body' }, 400);
+			return jsonResponse({ error: 'invalid body: expected a binary .rbxl file or a JSON payload' }, 400);
 		}
 		if (!payload || !payload.objects || !payload.url) {
 			return jsonResponse({ error: 'missing objects or url in JSON body' }, 400);
@@ -452,7 +448,6 @@ export default {
 			if (path === '/asset') return handleAsset(request, env, ctx, url);
 		}
 		if (request.method === 'POST' && path === '/publish') return handlePublish(request);
-	if (request.method === 'POST' && path === '/publishmodel') return handlePublishModel(request);
 
 		return jsonResponse({ error: 'not found' }, 404);
 	},

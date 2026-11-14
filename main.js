@@ -1,6 +1,6 @@
 // SMFX Proxy (Node.js / Express)
 // Rotas: GET /health | POST /publish (monta RBXL binario e envia ao Open Cloud) | GET /get (leitura *.roblox.com)
-// POST /publishmodel (sobe FBX/GLB/GLTF/RBXM/RBXMX ao Open Cloud) | GET /games, /playergames, /groupgames, /gameinfo | GET /asset | /compress, /decompress | /rig/catalog | GET /stats (bytes por rota)
+// GET /games, /playergames, /groupgames, /gameinfo | GET /asset | /compress, /decompress | /rig/catalog | GET /stats (bytes por rota)
 
 const express = require('express');
 const zlib = require('zlib');
@@ -11,7 +11,9 @@ const app = express();
 
 require('./metrics').register(app); // contador de bytes por rota (GET /stats)
 
-app.use(express.json({ limit: '50mb' })); // projeto grande gera JSON grande
+// /publish le o corpo cru e decide pelo conteudo (binario .rbxl ou JSON), entao fica fora do parser JSON global.
+const jsonParser = express.json({ limit: '50mb' }); // projeto grande gera JSON grande
+app.use((req, res, next) => (req.path === '/publish' ? next() : jsonParser(req, res, next)));
 
 // ---------------------------------------------------------------------------
 // Rotas
@@ -34,7 +36,7 @@ app.get('/health', (req, res) => {
 const PUBLISH_HOST = 'apis.roblox.com';
 const RBXL_MAGIC = '<roblox!';
 
-app.post('/publish', express.raw({ type: 'application/octet-stream', limit: '50mb' }), async (req, res) => {
+app.post('/publish', express.raw({ type: () => true, limit: '50mb' }), async (req, res) => {
 	const apiKey = req.headers['x-api-key'];
 	if (!apiKey) {
 		return res.status(400).json({ error: 'missing x-api-key header' });
@@ -43,17 +45,21 @@ app.post('/publish', express.raw({ type: 'application/octet-stream', limit: '50m
 	let rawUrl;
 	let fileBody;
 
-	if (Buffer.isBuffer(req.body)) {
+	const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+
+	if (raw.subarray(0, RBXL_MAGIC.length).toString('latin1') === RBXL_MAGIC) {
 		rawUrl = req.headers['x-publish-url'] || req.query.url;
 		if (!rawUrl) {
-			return res.status(400).json({ error: 'missing x-publish-url header' });
+			return res.status(400).json({ error: 'missing upload url (url query parameter)' });
 		}
-		if (req.body.subarray(0, RBXL_MAGIC.length).toString('latin1') !== RBXL_MAGIC) {
-			return res.status(400).json({ error: 'request body is not a binary .rbxl file' });
-		}
-		fileBody = req.body;
+		fileBody = raw;
 	} else {
-		const payload = req.body;
+		let payload;
+		try {
+			payload = JSON.parse(raw.toString('utf8'));
+		} catch (e) {
+			return res.status(400).json({ error: 'invalid body: expected a binary .rbxl file or a JSON payload' });
+		}
 		if (!payload || !payload.objects || !payload.url) {
 			return res.status(400).json({ error: 'missing objects or url in JSON body' });
 		}
@@ -387,7 +393,6 @@ app.get('/asset', async (req, res) => {
 });
 
 require('./compress').register(app, express);
-require('./model-publish').register(app, express);
 require('./rig-catalog').register(app);
 
 const port = process.env.PORT || 8080;
