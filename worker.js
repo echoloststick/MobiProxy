@@ -3,12 +3,14 @@
 //
 // Routes: GET /health | GET /get | GET /games, /playergames, /groupgames, /gameinfo
 //         GET /asset (parsed with asset-parsers.js) | POST /publish (built with rbxl-builder.js)
+//         POST /publishmodel (model upload, see model-publish.js)
 // Requires the "nodejs_compat" flag (Buffer / zlib used by the two shared modules).
 // Optional bindings: ASSET_CACHE (KV) caches /asset results; OPEN_CLOUD_API_KEY (secret) is the fallback
 // API key for /asset when the player does not send one.
 
 import { buildRBXL } from './rbxl-builder.js';
 import { extractAssetTreesFromXML, extractAssetTreesFromBinary } from './asset-parsers.js';
+import { handleWorker as handlePublishModel } from './model-publish.js';
 
 const GAMES_PAGE_LIMIT = 50;
 const MAX_GAMES_PAGES = 10;
@@ -366,8 +368,8 @@ function validatePublishUrl(rawUrl) {
 }
 
 // Two request shapes are accepted:
-//  1. Binary .rbxl built in-game: Content-Type application/octet-stream, the Open Cloud upload URL in the
-//     x-publish-url header (or the "url" query parameter). The file is forwarded as is.
+//  1. Binary .rbxl built in-game: the Open Cloud upload URL comes in the "url" query parameter (Roblox rejects "?"
+//     in header values) or the x-publish-url header. The file is forwarded as is.
 //  2. JSON { objects, defaults, url }: the place file is built here (fallback converter).
 async function handlePublish(request) {
 	const apiKey = request.headers.get('x-api-key');
@@ -448,6 +450,7 @@ export default {
 			if (path === '/asset') return handleAsset(request, env, ctx, url);
 		}
 		if (request.method === 'POST' && path === '/publish') return handlePublish(request);
+	if (request.method === 'POST' && path === '/publishmodel') return handlePublishModel(request);
 
 		return jsonResponse({ error: 'not found' }, 404);
 	},
