@@ -488,7 +488,7 @@ function prepareObjects(objects, fillMissing) {
 			}
 		}
 	}
-	if (fillMissing && anyMeshSize) {
+	if (fillMissing) {
 		for (const [id, data] of Object.entries(result)) {
 			if (data && data.className === 'MeshPart' && data.properties && !data.properties.InitialSize) {
 				const size = data.properties.Size;
