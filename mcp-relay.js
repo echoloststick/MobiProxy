@@ -36,7 +36,7 @@ Formato dos valores de propriedade:
 - Enum (Material, PartType, etc): só o nome do item, ex: "SmoothPlastic", "Neon"
 - Instância (ex: Parent): caminho completo como string, ex: "game/Workspace/Baseplate"
 
-Dicas: use get_tree antes de editar para confirmar os caminhos; edit_instance só altera as propriedades citadas; ao reescrever um script com write_script, envie o código completo e válido em Luau. Se o jogo não estiver conectado, peça ao jogador para ativar "Connect Claude" no Studio Mobi.
+Dicas: use get_tree antes de editar para confirmar os caminhos; edit_instance só altera as propriedades citadas; ao reescrever um script com write_script, envie o código completo e válido em Luau. Chat do jogo: quando o jogador pedir para ver as mensagens do Studio Mobi, chame get_chat_messages, execute o que for pedido com as outras ferramentas e responda cada mensagem com reply_chat (no idioma do jogador, curto: a tela é de celular). A resposta só aparece no jogo por reply_chat.\n\nSe o jogo não estiver conectado, peça ao jogador para ativar "Connect Claude" no Studio Mobi.
 `.trim();
 
 const PATH_HELP = 'Path like "game/Workspace/Part"';
@@ -81,6 +81,16 @@ const TOOLS = [
 		name: 'write_script',
 		description: 'Replaces the source of a Script, LocalScript or ModuleScript with complete, valid Luau.',
 		inputSchema: obj({ path: str('Script path'), source: str('New source code') }, ['path', 'source']),
+	},
+	{
+		name: 'get_chat_messages',
+		description: 'Returns the in-game chat messages the player sent that are still waiting for an answer (they expire after 2 minutes).',
+		inputSchema: obj({}),
+	},
+	{
+		name: 'reply_chat',
+		description: 'Posts the answer to one in-game chat message (use the id from get_chat_messages). Short, in the player language.',
+		inputSchema: obj({ id: str('Message id'), text: str('Answer shown in the game chat') }, ['id', 'text']),
 	},
 	{
 		name: 'get_console',
