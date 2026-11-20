@@ -8,10 +8,10 @@
 //   Response: { commands = { { id, tool, args } } } (empty list after ~25 s without work).
 // - This proxy only relays structured tool calls. It never executes code and has no "run Luau" tool.
 
-const TOKEN_RE = /^[A-Za-z0-9_-]{32,80}$/;
+const TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
 const MAX_BODY_BYTES = 512 * 1024;
 const MAX_ARGS_CHARS = 200 * 1024;
-const POLL_WAIT_MS = 25000;
+const POLL_WAIT_MS = 20000;
 const CALL_WAIT_MS = 25000;
 const CONNECTED_TTL_MS = 60000;
 const MAX_PENDING = 20;
