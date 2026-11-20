@@ -245,24 +245,24 @@ export class McpRelay {
 				entry.resolve(r.ok ? { ok: true, result: r.result } : { ok: false, error: String(r.error || 'The command failed.').slice(0, 2000) });
 			}
 		}
-		if (this.waiter) this.release([]); // a newer poll replaces the previous one
+		if (this.waiter) this.release({ commands: [], replaced: true }); // newest poller wins; the older one must stop
 		if (this.queue.length > 0) return { commands: this.queue.splice(0, 10) };
 
 		return new Promise((resolve) => {
-			const timer = setTimeout(() => this.release([]), POLL_WAIT_MS);
-			this.waiter = { resolve: (commands) => resolve({ commands }), timer };
+			const timer = setTimeout(() => this.release({ commands: [] }), POLL_WAIT_MS);
+			this.waiter = { resolve, timer };
 		});
 	}
 
 	flush() {
-		if (this.waiter && this.queue.length > 0) this.release(this.queue.splice(0, 10));
+		if (this.waiter && this.queue.length > 0) this.release({ commands: this.queue.splice(0, 10) });
 	}
 
-	release(commands) {
+	release(payload) {
 		const w = this.waiter;
 		this.waiter = null;
 		clearTimeout(w.timer);
 		this.lastPoll = Date.now();
-		w.resolve(commands);
+		w.resolve(payload);
 	}
 }
