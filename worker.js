@@ -11,6 +11,9 @@
 import { buildRBXL } from './rbxl-builder.js';
 import { extractAssetTreesFromXML, extractAssetTreesFromBinary } from './asset-parsers.js';
 import { handleWorker as handlePublishModel } from './model-publish.js';
+import { handleMcp } from './mcp-relay.js';
+
+export { McpRelay } from './mcp-relay.js';
 
 const GAMES_PAGE_LIMIT = 50;
 const MAX_GAMES_PAGES = 10;
@@ -439,6 +442,8 @@ export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const path = url.pathname;
+
+		if (path.startsWith('/mcp/')) return handleMcp(request, env, url);
 
 		if (request.method === 'GET') {
 			if (path === '/health') return new Response('ok', { headers: { 'Content-Type': 'text/plain' } });
