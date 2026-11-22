@@ -1,7 +1,7 @@
 // SMFX Proxy -- Cloudflare Worker entry (ES Module). Runs the whole proxy; no Render origin needed.
 // Render can keep running main.js (Express) in parallel; this file is what Cloudflare executes (see wrangler.jsonc).
 //
-// Routes: GET /health | GET /get | GET /games, /playergames, /groupgames, /gameinfo
+// Routes: GET /health | GET /get | GET /games, /playergames (userId or userIds=1,2,3), /groupgames, /gameinfo
 //         GET /asset (parsed with asset-parsers.js) | POST /publish (built with rbxl-builder.js)
 //         POST /publishmodel (model upload, see model-publish.js)
 //         POST /createplace (new place or subplace with the player's cookie, see create-place.js; never stored)
@@ -19,6 +19,8 @@ export { McpRelay } from './mcp-relay.js';
 
 const GAMES_PAGE_LIMIT = 50;
 const MAX_GAMES_PAGES = 10;
+const MAX_BATCH_USERS = 50;
+const BATCH_CONCURRENCY = 5;
 const ASSET_CACHE_TTL_SECONDS = 60 * 60 * 24 * 7;
 const ASSET_CACHE_MAX_CHARS = 20 * 1024 * 1024;
 const PUBLISH_HOST = 'apis.roblox.com';
@@ -158,6 +160,69 @@ async function handleGames(url, kind) {
 	} catch (e) {
 		return jsonResponse({ error: `upstream request failed: ${e.message}` }, 502);
 	}
+}
+
+// Batch lookup: /playergames?userIds=1,2,3 -> { users: { "1": [games], "2": [games], "3": null } }
+// A user whose lookup fails is returned as null so one bad id does not fail the whole batch.
+async function handleBatchPlayerGames(url) {
+	const ids = [...new Set((url.searchParams.get('userIds') || '').split(',').map((s) => s.trim()).filter(Boolean))];
+	if (ids.length === 0 || !ids.every(isPositiveInteger)) {
+		return jsonResponse({ error: 'missing or invalid userIds query parameter (comma-separated positive integers)' }, 400);
+	}
+	if (ids.length > MAX_BATCH_USERS) {
+		return jsonResponse({ error: `too many userIds (maximum ${MAX_BATCH_USERS} per request)` }, 400);
+	}
+
+	const users = {};
+	let next = 0;
+	const worker = async () => {
+		while (next < ids.length) {
+			const id = ids[next++];
+			try {
+				const base = `https://games.roblox.com/v2/users/${id}/games?limit=${GAMES_PAGE_LIMIT}&sortOrder=Asc`;
+				users[id] = withIcons(await fetchGamesPaged(base));
+			} catch (e) {
+				console.warn(`[SMFX Proxy] Games lookup failed for user ${id}: ${e.message}`);
+				users[id] = null;
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(BATCH_CONCURRENCY, ids.length) }, worker));
+	return jsonResponse({ users });
+}
+
+// Batch lookup: /gameinfo?universeIds=1,2,3 -> { games: { "1": { name, icon, placeId }, ... } }
+// One Roblox request serves the whole batch. Ids Roblox does not return keep name/placeId null (icon is always set).
+async function handleBatchGameInfo(url) {
+	const ids = [...new Set((url.searchParams.get('universeIds') || '').split(',').map((s) => s.trim()).filter(Boolean))];
+	if (ids.length === 0 || !ids.every(isPositiveInteger)) {
+		return jsonResponse({ error: 'missing or invalid universeIds query parameter (comma-separated positive integers)' }, 400);
+	}
+	if (ids.length > MAX_BATCH_USERS) {
+		return jsonResponse({ error: `too many universeIds (maximum ${MAX_BATCH_USERS} per request)` }, 400);
+	}
+
+	const games = {};
+	for (const id of ids) games[id] = { name: null, icon: gameIconUri(id), placeId: null };
+
+	try {
+		const upstream = await robloxGet(`https://games.roblox.com/v1/games?universeIds=${ids.join(',')}`, {
+			ttlSeconds: GAME_INFO_CACHE_TTL_SECONDS,
+		});
+		if (upstream.ok) {
+			const body = JSON.parse(upstream.body);
+			for (const entry of body.data || []) {
+				const target = entry && games[entry.id];
+				if (target) {
+					target.name = entry.name || null;
+					target.placeId = entry.rootPlaceId || null;
+				}
+			}
+		}
+	} catch (e) {
+		console.warn(`[SMFX Proxy] Batch game info lookup failed: ${e.message}`);
+	}
+	return jsonResponse({ games });
 }
 
 async function handleGameInfo(url) {
@@ -451,9 +516,13 @@ export default {
 			if (path === '/health') return new Response('ok', { headers: { 'Content-Type': 'text/plain' } });
 			if (path === '/get') return handleGet(request, url);
 			if (path === '/games') return handleGames(url, 'plain');
-			if (path === '/playergames') return handleGames(url, 'users');
+			if (path === '/playergames') {
+				return url.searchParams.has('userIds') ? handleBatchPlayerGames(url) : handleGames(url, 'users');
+			}
 			if (path === '/groupgames') return handleGames(url, 'groups');
-			if (path === '/gameinfo') return handleGameInfo(url);
+			if (path === '/gameinfo') {
+				return url.searchParams.has('universeIds') ? handleBatchGameInfo(url) : handleGameInfo(url);
+			}
 			if (path === '/asset') return handleAsset(request, env, ctx, url);
 		}
 		if (request.method === 'POST' && path === '/publish') return handlePublish(request);
