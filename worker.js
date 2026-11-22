@@ -4,6 +4,7 @@
 // Routes: GET /health | GET /get | GET /games, /playergames, /groupgames, /gameinfo
 //         GET /asset (parsed with asset-parsers.js) | POST /publish (built with rbxl-builder.js)
 //         POST /publishmodel (model upload, see model-publish.js)
+//         POST /createplace (new place or subplace with the player's cookie, see create-place.js; never stored)
 // Requires the "nodejs_compat" flag (Buffer / zlib used by the two shared modules).
 // Optional bindings: ASSET_CACHE (KV) caches /asset results; OPEN_CLOUD_API_KEY (secret) is the fallback
 // API key for /asset when the player does not send one.
@@ -12,6 +13,7 @@ import { buildRBXL } from './rbxl-builder.js';
 import { extractAssetTreesFromXML, extractAssetTreesFromBinary } from './asset-parsers.js';
 import { handleWorker as handlePublishModel } from './model-publish.js';
 import { handleMcp } from './mcp-relay.js';
+import { handleCreatePlace } from './create-place.js';
 
 export { McpRelay } from './mcp-relay.js';
 
@@ -455,7 +457,8 @@ export default {
 			if (path === '/asset') return handleAsset(request, env, ctx, url);
 		}
 		if (request.method === 'POST' && path === '/publish') return handlePublish(request);
-	if (request.method === 'POST' && path === '/publishmodel') return handlePublishModel(request);
+		if (request.method === 'POST' && path === '/publishmodel') return handlePublishModel(request);
+		if (request.method === 'POST' && path === '/createplace') return handleCreatePlace(request);
 
 		return jsonResponse({ error: 'not found' }, 404);
 	},
