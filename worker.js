@@ -3,7 +3,7 @@
 //
 // Routes: GET /health | GET /get | GET /games, /playergames (userId or userIds=1,2,3), /groupgames, /gameinfo
 //         GET /asset (parsed with asset-parsers.js) | POST /publish (built with rbxl-builder.js)
-//         POST /publishmodel (model upload, see model-publish.js)
+//         POST /batch (many GET lookups in one request, used by SMFXProxyHub) | POST /publishmodel (model upload, see model-publish.js)
 //         POST /createplace (new place or subplace with the player's cookie, see create-place.js; never stored)
 // Requires the "nodejs_compat" flag (Buffer / zlib used by the two shared modules).
 // Optional bindings: ASSET_CACHE (KV) caches /asset results; OPEN_CLOUD_API_KEY (secret) is the fallback
@@ -14,6 +14,7 @@ import { extractAssetTreesFromXML, extractAssetTreesFromBinary } from './asset-p
 import { handleWorker as handlePublishModel } from './model-publish.js';
 import { handleMcp } from './mcp-relay.js';
 import { handleCreatePlace } from './create-place.js';
+import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } from 'node:zlib';
 
 export { McpRelay } from './mcp-relay.js';
 
@@ -502,11 +503,100 @@ async function handlePublish(request) {
 }
 
 // ---------------------------------------------------------------------------
+// Batch: POST /batch { requests: [ { id, path, headers? } ] } -> { results: [ { id, status, contentType, body } ] }
+// One request carries many GET lookups (see SMFXProxyHub in the game). Each item runs through the normal router.
+// ---------------------------------------------------------------------------
+
+const BATCH_MAX_WEIGHT = 20; // keeps CPU time and subrequests of one invocation bounded
+const BATCH_ITEM_CONCURRENCY = 4;
+const BATCH_PATH_WEIGHTS = { '/get': 1, '/gameinfo': 1, '/games': 2, '/playergames': 2, '/groupgames': 2, '/asset': 10 };
+
+async function handleBatch(request, env, ctx) {
+	let payload;
+	try {
+		payload = await request.json();
+	} catch (e) {
+		return jsonResponse({ error: 'invalid JSON body' }, 400);
+	}
+	const items = payload && payload.requests;
+	if (!Array.isArray(items) || items.length === 0) return jsonResponse({ error: 'missing requests array' }, 400);
+
+	const origin = new URL(request.url).origin;
+	const targets = [];
+	let weight = 0;
+	for (const item of items) {
+		let target = null;
+		try {
+			target = new URL(String(item && item.path), origin);
+		} catch (e) {
+			// Rejected below.
+		}
+		const cost = target && target.origin === origin ? BATCH_PATH_WEIGHTS[target.pathname] : 0;
+		if (!cost) return jsonResponse({ error: 'path not allowed in a batch' }, 400);
+		weight += cost;
+		targets.push(target);
+	}
+	if (weight > BATCH_MAX_WEIGHT) return jsonResponse({ error: `batch too large (maximum weight ${BATCH_MAX_WEIGHT})` }, 400);
+
+	const results = new Array(items.length);
+	let next = 0;
+	const runner = async () => {
+		while (next < items.length) {
+			const index = next++;
+			const id = items[index].id;
+			try {
+				const headers = {};
+				const key = items[index].headers && items[index].headers['x-api-key'];
+				if (typeof key === 'string' && key) headers['x-api-key'] = key;
+				const res = await route(new Request(targets[index].toString(), { method: 'GET', headers }), env, ctx);
+				results[index] = {
+					id,
+					status: res.status,
+					contentType: res.headers.get('content-type') || 'application/json',
+					body: await res.text(),
+				};
+			} catch (e) {
+				results[index] = { id, status: 502, contentType: 'application/json', body: JSON.stringify({ error: `batch item failed: ${e.message}` }) };
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(BATCH_ITEM_CONCURRENCY, items.length) }, runner));
+	return jsonResponse({ results });
+}
+
+// ---------------------------------------------------------------------------
+// Legacy save format "MZ1:br:..." (SMFXSaveCodecLegacy): chunks are brotli compressed and carried as base64url text.
+// Old saves still need /decompress to be opened.
+// ---------------------------------------------------------------------------
+
+const COMPRESS_MAX_BYTES = 1000000;
+const DECOMPRESS_MAX_BYTES = 4000000;
+
+async function handleCompress(request) {
+	const input = Buffer.from(await request.arrayBuffer());
+	if (input.length === 0 || input.length > COMPRESS_MAX_BYTES) return jsonResponse({ error: 'invalid body size' }, 400);
+	const output = brotliCompressSync(input, {
+		params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 9, [zlibConstants.BROTLI_PARAM_SIZE_HINT]: input.length },
+	});
+	return new Response(output.toString('base64url'), { headers: { 'Content-Type': 'text/plain' } });
+}
+
+async function handleDecompress(request) {
+	const text = (await request.text()).trim();
+	if (!/^[A-Za-z0-9_-]+$/.test(text) || text.length > COMPRESS_MAX_BYTES * 2) return jsonResponse({ error: 'invalid body' }, 400);
+	try {
+		const output = brotliDecompressSync(Buffer.from(text, 'base64url'), { maxOutputLength: DECOMPRESS_MAX_BYTES });
+		return new Response(output, { headers: { 'Content-Type': 'application/octet-stream' } });
+	} catch (e) {
+		return jsonResponse({ error: 'decompression failed' }, 400);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
-export default {
-	async fetch(request, env, ctx) {
+async function route(request, env, ctx) {
 		const url = new URL(request.url);
 		const path = url.pathname;
 
@@ -525,10 +615,18 @@ export default {
 			}
 			if (path === '/asset') return handleAsset(request, env, ctx, url);
 		}
+		if (request.method === 'POST' && path === '/batch') return handleBatch(request, env, ctx);
+		if (request.method === 'POST' && path === '/compress') return handleCompress(request);
+		if (request.method === 'POST' && path === '/decompress') return handleDecompress(request);
 		if (request.method === 'POST' && path === '/publish') return handlePublish(request);
 		if (request.method === 'POST' && path === '/publishmodel') return handlePublishModel(request);
 		if (request.method === 'POST' && path === '/createplace') return handleCreatePlace(request);
 
-		return jsonResponse({ error: 'not found' }, 404);
+				return jsonResponse({ error: 'not found' }, 404);
+}
+
+export default {
+	fetch(request, env, ctx) {
+		return route(request, env, ctx);
 	},
 };
